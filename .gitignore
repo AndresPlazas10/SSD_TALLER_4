@@ -4,4 +4,3 @@ node_modules/
 *.db-wal
 *.db-shm
 .env
-.env.example
