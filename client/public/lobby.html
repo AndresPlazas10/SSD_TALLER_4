@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Uber vs Taxi · Lobby</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚕</text></svg>" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Russo+One&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-left user">
+      <div class="avatar" id="my-avatar" aria-hidden="true"></div>
+      <div class="user-info">
+        <strong id="me"></strong>
+        <span class="status" id="status">Conectando…</span>
+      </div>
+    </div>
+    <a class="logo" href="/lobby"><span class="l-uber">UBER</span><span class="l-vs">vs</span><span class="l-taxi">TAXI</span></a>
+    <div class="nav-right">
+      <button type="button" id="logout" class="nav-btn danger">Cerrar sesión</button>
+    </div>
+  </nav>
+
+  <main class="container">
+    <div class="card">
+      <div class="lobby-head">
+        <h2>🚦 Jugadores en línea</h2>
+        <span class="count-pill"><span id="count">0</span> en la calle</span>
+      </div>
+      <ul id="players"></ul>
+      <p class="empty hidden" id="empty">Esperando conductores…</p>
+    </div>
+  </main>
+
+  <div class="road" aria-hidden="true">
+    <svg class="car car-uber" viewBox="0 0 122 50"><path d="M8 34 Q8 26 16 25 L34 23 L46 12 Q49 9 54 9 L80 9 Q85 9 88 13 L97 23 L108 25 Q114 26 114 32 L114 36 Q114 38 112 38 L10 38 Q8 38 8 36 Z" fill="#2a2d36" stroke="#4a4f5c"/><path d="M38 23 L48 13 Q50 12 53 12 L64 12 L64 23 Z M68 12 L80 12 Q83 12 85 15 L92 23 L68 23 Z" fill="#7fe9c6" opacity=".55"/><rect x="108" y="27" width="6" height="3" rx="1.5" fill="#fff"/><circle cx="30" cy="38" r="9" fill="#0a0a0a"/><circle cx="92" cy="38" r="9" fill="#0a0a0a"/></svg>
+    <svg class="car car-taxi" viewBox="0 0 122 50"><rect x="54" y="1" width="20" height="8" rx="2" fill="#0a0a0a"/><path d="M8 34 Q8 26 16 25 L34 23 L46 12 Q49 9 54 9 L80 9 Q85 9 88 13 L97 23 L108 25 Q114 26 114 32 L114 36 Q114 38 112 38 L10 38 Q8 38 8 36 Z" fill="#ffd54d" stroke="#0a0a0a" stroke-width="1.5"/><path d="M38 23 L48 13 Q50 12 53 12 L64 12 L64 23 Z M68 12 L80 12 Q83 12 85 15 L92 23 L68 23 Z" fill="#1d2230"/><rect x="108" y="27" width="6" height="3" rx="1.5" fill="#fff"/><circle cx="30" cy="38" r="9" fill="#0a0a0a"/><circle cx="92" cy="38" r="9" fill="#0a0a0a"/></svg>
+  </div>
+
+  <script src="/config.js"></script>
+  <script src="/common.js"></script>
+  <script>
+    const { COORDINATOR_WS } = window.APP_CONFIG;
+    const token = localStorage.getItem('token');
+    const myUsername = localStorage.getItem('username') || '';
+
+    // replace(): el lobby no queda en el historial, así el botón Atrás del
+    // navegador no puede volver a una sesión ya cerrada.
+    function goToLogin(message) {
+      if (message) setFlash(message, 'info');
+      window.location.replace('/login');
+    }
+
+    // Si el navegador restaura esta página desde su caché de historial (bfcache)
+    // el script no se vuelve a ejecutar: recargar para revalidar el token.
+    window.addEventListener('pageshow', (event) => {
+      if (event.persisted) window.location.reload();
+    });
+
+    // Color de avatar estable a partir del nombre (solo decorativo)
+    const AVATAR_COLORS = ['#ffc928', '#2ee6a6', '#6aa8ff', '#ff8a5c', '#c79bff', '#ff6fa8'];
+    function avatarFor(name) {
+      let h = 0;
+      for (const ch of name) h = (h * 31 + ch.codePointAt(0)) >>> 0;
+      const el = document.createElement('div');
+      el.className = 'avatar';
+      el.style.background = AVATAR_COLORS[h % AVATAR_COLORS.length];
+      el.textContent = (name[0] || '?').toUpperCase();
+      return el;
+    }
+
+    if (!token) {
+      goToLogin('Debes iniciar sesión primero');
+    } else {
+      document.getElementById('me').textContent = myUsername;
+      const myAvatar = document.getElementById('my-avatar');
+      myAvatar.replaceWith(avatarFor(myUsername));
+
+      let manualLogout = false;
+      const ws = new WebSocket(`${COORDINATOR_WS}/connect?token=${encodeURIComponent(token)}`);
+
+      ws.onopen = () => {
+        const status = document.getElementById('status');
+        status.textContent = 'En línea';
+        status.classList.add('online');
+      };
+
+      function renderPlayers(players) {
+        const ul = document.getElementById('players');
+        ul.innerHTML = '';
+        for (const p of players) {
+          const li = document.createElement('li');
+          const text = document.createElement('div');
+          text.className = 'player-text';
+          const name = document.createElement('div');
+          name.className = 'name';
+          name.textContent = p.username; // textContent evita XSS
+          const sub = document.createElement('div');
+          sub.className = 'sub';
+          const dot = document.createElement('span');
+          dot.className = 'dot';
+          sub.append(dot, 'En línea');
+          text.append(name, sub);
+          li.append(avatarFor(p.username), text);
+          if (p.username === myUsername) {
+            li.classList.add('is-me');
+            const me = document.createElement('span');
+            me.className = 'me';
+            me.textContent = 'Tú';
+            li.append(me);
+          }
+          ul.append(li);
+        }
+        document.getElementById('count').textContent = players.length;
+        document.getElementById('empty').classList.toggle('hidden', players.length > 0);
+      }
+
+      ws.onmessage = (event) => {
+        let msg;
+        try { msg = JSON.parse(event.data); } catch (_) { return; }
+        if (msg.type === 'players_update') renderPlayers(msg.players);
+      };
+
+      ws.onclose = (event) => {
+        if (manualLogout) return;
+        // localStorage se comparte entre pestañas: si esta sesión fue reemplazada
+        // por otra pestaña (4002) NO borramos el token, porque lo usa la otra.
+        if (event.code === 4002) {
+          return goToLogin('Tu sesión se abrió en otra pestaña y esta fue cerrada.');
+        }
+        localStorage.removeItem('token');
+        localStorage.removeItem('username');
+        if (event.code === 4001) {
+          goToLogin(
+            event.reason === 'token expired'
+              ? 'Tu sesión expiró. Inicia sesión de nuevo.'
+              : 'Token inválido. Inicia sesión de nuevo.'
+          );
+        } else {
+          goToLogin('Se perdió la conexión con el coordinador. Inicia sesión de nuevo.');
+        }
+      };
+
+      document.getElementById('logout').addEventListener('click', () => {
+        manualLogout = true;
+        localStorage.removeItem('token');
+        localStorage.removeItem('username');
+        ws.close(1000, 'logout');
+        goToLogin('Sesión cerrada.');
+      });
+    }
+  </script>
+</body>
+</html>

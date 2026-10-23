@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Uber vs Taxi · Registrarse</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚕</text></svg>" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Russo+One&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-left"></div>
+    <a class="logo" href="/"><span class="l-uber">UBER</span><span class="l-vs">vs</span><span class="l-taxi">TAXI</span></a>
+    <div class="nav-right">
+      <a class="nav-btn" href="/login">Iniciar sesión</a>
+      <a class="nav-btn primary" href="/register" aria-current="page">Registrarse</a>
+    </div>
+  </nav>
+
+  <main class="container narrow form-page">
+    <h1>🪪 Registrarse</h1>
+    <p class="lead">Saca tu licencia de conductor.</p>
+
+    <div id="banner" class="msg hidden"></div>
+
+    <form id="register-form" class="card card-uber">
+      <label for="reg-username">Usuario (3-20: letras, números, _)</label>
+      <input id="reg-username" autocomplete="username" placeholder="nuevo_conductor" required />
+      <label for="reg-password">Contraseña (mín. 6)</label>
+      <input id="reg-password" type="password" autocomplete="new-password" placeholder="mínimo 6 caracteres" required />
+      <button type="submit" class="secondary">Crear cuenta</button>
+    </form>
+
+    <p class="switch">¿Ya tienes cuenta? <a href="/login">Inicia sesión</a></p>
+  </main>
+
+  <div class="road" aria-hidden="true">
+    <svg class="car car-uber" viewBox="0 0 122 50"><path d="M8 34 Q8 26 16 25 L34 23 L46 12 Q49 9 54 9 L80 9 Q85 9 88 13 L97 23 L108 25 Q114 26 114 32 L114 36 Q114 38 112 38 L10 38 Q8 38 8 36 Z" fill="#2a2d36" stroke="#4a4f5c"/><path d="M38 23 L48 13 Q50 12 53 12 L64 12 L64 23 Z M68 12 L80 12 Q83 12 85 15 L92 23 L68 23 Z" fill="#7fe9c6" opacity=".55"/><rect x="108" y="27" width="6" height="3" rx="1.5" fill="#fff"/><circle cx="30" cy="38" r="9" fill="#0a0a0a"/><circle cx="92" cy="38" r="9" fill="#0a0a0a"/></svg>
+    <svg class="car car-taxi" viewBox="0 0 122 50"><rect x="54" y="1" width="20" height="8" rx="2" fill="#0a0a0a"/><path d="M8 34 Q8 26 16 25 L34 23 L46 12 Q49 9 54 9 L80 9 Q85 9 88 13 L97 23 L108 25 Q114 26 114 32 L114 36 Q114 38 112 38 L10 38 Q8 38 8 36 Z" fill="#ffd54d" stroke="#0a0a0a" stroke-width="1.5"/><path d="M38 23 L48 13 Q50 12 53 12 L64 12 L64 23 Z M68 12 L80 12 Q83 12 85 15 L92 23 L68 23 Z" fill="#1d2230"/><rect x="108" y="27" width="6" height="3" rx="1.5" fill="#fff"/><circle cx="30" cy="38" r="9" fill="#0a0a0a"/><circle cx="92" cy="38" r="9" fill="#0a0a0a"/></svg>
+  </div>
+
+  <script src="/config.js"></script>
+  <script src="/common.js"></script>
+  <script>
+    document.getElementById('register-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const username = document.getElementById('reg-username').value.trim();
+      const password = document.getElementById('reg-password').value;
+      try {
+        const { status, data } = await authPost('/register', { username, password });
+        if (status === 201) {
+          // Usuario creado: ir a /login con el usuario ya escrito
+          setFlash(`Usuario "${data.username}" creado. Ya puedes iniciar sesión.`, 'ok');
+          try { sessionStorage.setItem('prefill-username', data.username); } catch (_) {}
+          window.location.href = '/login';
+        } else {
+          show(data.error || `Error ${status}`, 'error');
+        }
+      } catch (err) {
+        show('No se pudo contactar el servicio de autenticación', 'error');
+      }
+    });
+  </script>
+</body>
+</html>
