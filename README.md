@@ -1,73 +1,286 @@
-# Tools
+# SSD Taller 4 — Proyecto Final Parte I: Identidad
 
-## clang-format
+Primera pieza del videojuego web multijugador del curso de Sistemas Distribuidos: **registro, login con JWT y lobby en tiempo real por WebSocket**.
 
-The clang-format checking tools is designed to check changed lines of code compared to given git-refs.
+El sistema está formado por tres procesos independientes que se comunican por red:
 
-## Migration Script
+| Componente | Carpeta | Puerto | Tecnología | Responsabilidad |
+|---|---|---|---|---|
+| Servicio de Autenticación | `auth-service/` | 4000 | Express + SQLite + bcrypt + JWT | Registrar usuarios, validar credenciales, emitir tokens |
+| Coordinador de Sesiones | `coordinator/` | 5000 | Express + `ws` + JWT | Validar el token en el upgrade, mantener jugadores en línea, hacer broadcast |
+| Cliente Web | `client/` | 3000 | HTML + JS plano (servido con Express) | Formularios de login/registro y lobby en vivo |
 
-The migration tool is designed to reduce repetitive work in the migration process. However, the script is not aiming to convert every thing for you. There are usually some small fixes and major reconstruction required.
+---
 
-### How To Use
+## 1. Arquitectura
 
-To run the conversion script, first make sure you have the latest `node-addon-api` in your `node_modules` directory.
 ```
-npm install node-addon-api
+                         ┌──────────────────────────────┐
+                         │        Navegador (x N)       │
+                         │  login / register / lobby    │
+                         │  token JWT en localStorage   │
+                         └───┬──────────┬───────────┬───┘
+            GET /, /login,   │          │           │  WebSocket
+            /lobby, /config.js          │ HTTP POST │  wss://.../connect?token=JWT
+                             │          │ /register │
+                             ▼          │ /login    ▼
+              ┌──────────────────┐      │     ┌──────────────────────────────┐
+              │  Cliente Web     │      │     │  Coordinador (puerto 5000)   │
+              │  (puerto 3000)   │      │     │  - verifica JWT en 'upgrade' │
+              │  sirve HTML/JS   │      │     │  - Map userId → {username,   │
+              │  y /config.js    │      │     │      socket, connectedAt}    │
+              └──────────────────┘      │     │  - broadcast players_update  │
+                                        ▼     └──────────────▲───────────────┘
+                         ┌──────────────────────────────┐    │
+                         │   Auth Service (puerto 4000) │    │ misma JWT_SECRET
+                         │  - bcrypt (≥10 rounds)       │    │ (vía .env)
+                         │  - firma JWT (1h)            │────┘
+                         │  - SQLite: users.db          │
+                         └──────────────────────────────┘
+
+   Con ngrok, cada servicio tiene su propio túnel HTTPS:
+   cliente → https://<cliente>.ngrok-free.app
+   auth    → https://<auth>.ngrok-free.app
+   coord.  → wss://<coordinador>.ngrok-free.app/connect?token=...
 ```
 
-Then run the script passing your project directory
+### Flujo
+
+1. El usuario se registra: el cliente hace `POST /register` al auth service, que hashea la contraseña con bcrypt y la guarda en SQLite.
+2. El usuario hace login: `POST /login` devuelve un JWT `{ userId, username, iat, exp }`. El cliente lo guarda en `localStorage` y redirige al lobby.
+3. El lobby abre `WebSocket` a `/connect?token=JWT`. El coordinador **verifica el JWT durante el `upgrade`** con la misma `JWT_SECRET`.
+   - Token inválido, vencido o firmado con otra clave → se cierra el socket con código **4001 `"invalid token"`**.
+   - Token válido → el jugador entra al `Map` y se envía `players_update` a **todos** los conectados.
+4. Cuando un socket se cierra, el coordinador lo elimina del `Map` y vuelve a hacer broadcast.
+
+Mensaje de broadcast:
+
+```json
+{ "type": "players_update", "players": [{ "userId": "1", "username": "alice" }] }
 ```
-node ./node_modules/node-addon-api/tools/conversion.js ./
+
+---
+
+## 2. Estructura del repositorio
+
+```
+SSD_TALLER_4/
+├── auth-service/
+│   ├── index.js          # POST /register, POST /login, GET /health
+│   ├── package.json
+│   └── .env.example
+├── coordinator/
+│   ├── index.js          # WS /connect, GET /health
+│   ├── package.json
+│   └── .env.example
+├── client/
+│   ├── server.js         # Express mínimo que sirve public/ y /config.js
+│   ├── package.json
+│   ├── .env.example
+│   └── public/
+│       ├── index.html
+│       ├── login.html
+│       ├── register.html
+│       ├── lobby.html
+│       ├── common.js
+│       └── style.css
+├── .gitignore            # node_modules/, *.db, .env
+└── README.md
 ```
 
-After finish, recompile and debug things that are missed by the script.
+---
 
+## 3. Cómo correr el proyecto
 
-### Quick Fixes
-Here is the list of things that can be fixed easily.
-  1. Change your methods' return value to void if it doesn't return value to JavaScript.
-  2. Use `.` to access attribute or to invoke member function in Napi::Object instead of `->`.
-  3. `Napi::New(env, value);` to `Napi::[Type]::New(env, value);
+### Requisitos
 
+- Node.js 18 o superior
+- npm
+- ngrok (solo para el despliegue público) con su authtoken configurado
 
-### Major Reconstructions
-The implementation of `Napi::ObjectWrap` is significantly different from NAN's. `Napi::ObjectWrap` takes a pointer to the wrapped object and creates a reference to the wrapped object inside ObjectWrap constructor. `Napi::ObjectWrap` also associates wrapped object's instance methods to Javascript module instead of static methods like NAN.
+### Paso 1 — Clonar
 
-So if you use Nan::ObjectWrap in your module, you will need to execute the following steps.
-
-  1. Convert your [ClassName]::New function to a constructor function that takes a `Napi::CallbackInfo`. Declare it as
+```bash
+git clone https://github.com/AndresPlazas10/SSD_TALLER_4.git
+cd SSD_TALLER_4
 ```
-[ClassName](const Napi::CallbackInfo& info);
-```
-and define it as
-```
-[ClassName]::[ClassName](const Napi::CallbackInfo& info) : Napi::ObjectWrap<[ClassName]>(info){
-  ...
-}
-```
-This way, the `Napi::ObjectWrap` constructor will be invoked after the object has been instantiated and `Napi::ObjectWrap` can use the `this` pointer to create a reference to the wrapped object.
 
-  2. Move your original constructor code into the new constructor. Delete your original constructor.
-  3. In your class initialization function, associate native methods in the following way.
+### Paso 2 — Auth service (puerto 4000)
+
+```bash
+cd auth-service
+npm install
+cp .env.example .env        # en Windows: copy .env.example .env
+# editar .env y poner una JWT_SECRET larga y aleatoria
+npm start
+# → Auth service en puerto 4000
 ```
-Napi::FunctionReference constructor;
 
-void [ClassName]::Init(Napi::Env env, Napi::Object exports, Napi::Object module) {
-  Napi::HandleScope scope(env);
-  Napi::Function ctor = DefineClass(env, "Canvas", {
-    InstanceMethod<&[ClassName]::Func1>("Func1"),
-    InstanceMethod<&[ClassName]::Func2>("Func2"),
-    InstanceAccessor<&[ClassName]::ValueGetter>("Value"),
-    StaticMethod<&[ClassName]::StaticMethod>("MethodName"),
-    InstanceValue("Value", Napi::[Type]::New(env, value)),
-  });
+### Paso 3 — Coordinador (puerto 5000)
 
-  constructor = Napi::Persistent(ctor);
-  constructor .SuppressDestruct();
-  exports.Set("[ClassName]", ctor);
-}
+En otra terminal:
+
+```bash
+cd coordinator
+npm install
+cp .env.example .env
+# poner EXACTAMENTE la misma JWT_SECRET que en auth-service/.env
+npm start
+# → Coordinador en puerto 5000
 ```
-  4. In function where you need to Unwrap the ObjectWrap in NAN like `[ClassName]* native = Nan::ObjectWrap::Unwrap<[ClassName]>(info.This());`, use `this` pointer directly as the unwrapped object as each ObjectWrap instance is associated with a unique object instance.
 
+### Paso 4 — Cliente (puerto 3000)
 
-If you still find issues after following this guide, please leave us an issue describing your problem and we will try to resolve it.
+En otra terminal:
+
+```bash
+cd client
+npm install
+cp .env.example .env
+npm start
+# → Cliente en puerto 3000
+```
+
+Abrir `http://localhost:3000`, registrarse, iniciar sesión y entrar al lobby. Abrir un segundo navegador (o ventana privada) con otro usuario para ver la lista actualizarse en vivo.
+
+### Variables de entorno
+
+Ningún secreto, puerto ni URL está hardcoded; todo viene de `.env` (cargado con `dotenv`). Cada servicio tiene su `.env.example` versionado.
+
+| Servicio | Variable | Ejemplo | Descripción |
+|---|---|---|---|
+| auth-service | `PORT` | `4000` | Puerto HTTP |
+| auth-service | `JWT_SECRET` | `...` | Secret para firmar los JWT |
+| auth-service | `JWT_EXPIRES_IN` | `1h` / `30s` | Expiración del token |
+| auth-service | `BCRYPT_ROUNDS` | `10` | Rondas de bcrypt (el servicio no arranca con menos de 10) |
+| auth-service | `DB_FILE` | `users.db` | Archivo SQLite |
+| coordinator | `PORT` | `5000` | Puerto HTTP + WS |
+| coordinator | `JWT_SECRET` | `...` | **La misma** que auth-service |
+| coordinator | `HEARTBEAT_MS` | `30000` | Intervalo de ping/pong |
+| client | `PORT` | `3000` | Puerto del servidor estático |
+| client | `AUTH_URL` / `COORDINATOR_WS` | `http://localhost:4000` / `ws://localhost:5000` | URLs locales |
+| client | `PUBLIC_AUTH_URL` / `PUBLIC_COORDINATOR_WS` | `https://...ngrok-free.app` / `wss://...ngrok-free.app` | URLs de ngrok |
+
+---
+
+## 4. Ejemplos con curl
+
+### Registro
+
+```bash
+curl -X POST http://localhost:4000/register \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"secret123"}'
+```
+
+| Caso | Código | Respuesta |
+|---|---|---|
+| Usuario creado | `201` | `{ "userId": 1, "username": "alice" }` |
+| Usuario ya existe | `409` | `{ "error": "El usuario ya existe" }` |
+| Body inválido / JSON mal formado | `400` | `{ "error": "..." }` |
+
+### Login
+
+```bash
+curl -X POST http://localhost:4000/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"secret123"}'
+```
+
+| Caso | Código | Respuesta |
+|---|---|---|
+| Credenciales válidas | `200` | `{ "token": "eyJhbGc...", "username": "alice" }` |
+| Credenciales inválidas | `401` | `{ "error": "Credenciales inválidas" }` |
+| Body inválido | `400` | `{ "error": "username y password son requeridos" }` |
+
+> En Windows PowerShell usar `curl.exe` y escapar las comillas del JSON, o probar desde Postman / Thunder Client.
+
+### Probar el coordinador con wscat
+
+```bash
+npm install -g wscat
+wscat -c "ws://localhost:5000/connect?token=PEGA_AQUI_EL_TOKEN"
+# En otra terminal conectar otro usuario: ambos reciben players_update
+wscat -c "ws://localhost:5000/connect?token=token_invalido"
+# → Disconnected (code: 4001, reason: "invalid token")
+```
+
+---
+
+## 5. Despliegue con ngrok
+
+Cada servicio en su propio túnel, en tres terminales:
+
+```bash
+# Terminal 1 — auth
+ngrok http 4000
+
+# Terminal 2 — coordinador
+ngrok http 5000
+
+# Terminal 3 — cliente
+ngrok http 3000
+```
+
+Después copiar las URLs que entrega ngrok en `client/.env` y reiniciar el cliente:
+
+```env
+PUBLIC_AUTH_URL=https://<url-auth>.ngrok-free.app
+PUBLIC_COORDINATOR_WS=wss://<url-coordinador>.ngrok-free.app
+```
+
+- Como ngrok sirve por **HTTPS**, el WebSocket debe ser **`wss://`** (si no, el navegador lo bloquea por contenido mixto).
+- El cliente sirve sus URLs desde `/config.js`: si se abre por `localhost` usa las URLs locales y si se abre por el túnel de ngrok usa las públicas, sin tocar el HTML.
+- Las peticiones del cliente al auth incluyen el header `ngrok-skip-browser-warning` para saltar la página intermedia del plan gratuito de ngrok.
+- El auth service usa `cors()` porque cliente y auth están en orígenes distintos.
+
+---
+
+## 6. Decisiones de diseño
+
+### Mismo usuario en dos pestañas → se desconecta la sesión anterior
+
+Si un usuario ya conectado abre una segunda conexión, el coordinador **cierra la conexión anterior con el código `4002 "session replaced"` y se queda con la nueva**.
+
+Justificación:
+- El `Map` está indexado por `userId`, así que solo puede haber un socket por jugador; en el juego final un jugador no puede tener dos posiciones a la vez.
+- Rechazar la segunda conexión dejaría al usuario bloqueado si la primera quedó "colgada" (pestaña congelada, red caída sin `close`). Reemplazarla siempre permite recuperar la sesión.
+- Es el comportamiento que espera el usuario: la pestaña que acaba de abrir es la que quiere usar.
+- En el `close` del socket viejo solo se borra el jugador del `Map` si el `Map` todavía apunta a **ese** socket, para no eliminar la sesión nueva.
+- El cliente, al recibir `4002`, muestra un aviso y vuelve al login **sin borrar el token**, porque `localStorage` es compartido y la otra pestaña lo sigue usando.
+
+### El JWT se verifica en el `upgrade`, no en `connection`
+
+Así un token inválido nunca llega a registrarse como jugador. Para que el navegador pueda leer el código **4001** se completa el handshake y se cierra de inmediato con `ws.close(4001, 'invalid token')`; si se respondiera con un `401` HTTP, el navegador solo vería un cierre genérico `1006`. Además se fija `algorithms: ['HS256']` y se exige que el payload tenga `userId` y `username`.
+
+### La sesión WS no dura más que el token
+
+Al aceptar la conexión se programa un temporizador hasta `exp`; al vencer, el coordinador cierra el socket con `4001 "token expired"` y el cliente vuelve al login. Con `JWT_EXPIRES_IN=30s` se reproduce el caso del token vencido en vivo.
+
+### Heartbeat (ping/pong)
+
+Cada `HEARTBEAT_MS` el coordinador envía `ping`; si un socket no respondió al anterior se termina. Así se detectan conexiones muertas que nunca disparan `close` (por ejemplo, el portátil se suspende) y el jugador no queda "en línea" para siempre.
+
+### Seguridad del auth service
+
+- Contraseñas con **bcrypt** (`BCRYPT_ROUNDS` ≥ 10; el servicio no arranca con menos). Se usa `bcryptjs` (implementación en JS puro, mismo formato de hash) para evitar compilar binarios nativos en Windows.
+- La contraseña **nunca** se devuelve ni se escribe en los logs; los logs solo muestran el username.
+- Login con mensaje genérico `"Credenciales inválidas"` y comparación contra un hash falso cuando el usuario no existe, para que no se pueda saber por tiempo de respuesta qué usuarios existen.
+- Validación del body: `username` de 3–20 caracteres `[A-Za-z0-9_]`, `password` de 6–72 caracteres (bcrypt solo usa 72 bytes). JSON mal formado → `400`.
+- Registro concurrente del mismo username: el `UNIQUE` de SQLite responde `409` en lugar de `500`.
+- `better-sqlite3` con consultas preparadas (sin inyección SQL).
+
+### Cliente
+
+- HTML + JS plano, sin frameworks. Los datos de otros jugadores se pintan con `textContent` (nunca `innerHTML`) para evitar XSS con usernames.
+- Login exitoso → token en `localStorage` → redirige a `/lobby`.
+- Botón **Cerrar sesión** → borra el token y cierra el WS.
+- Si el WS se cierra inesperadamente (token inválido/vencido, coordinador caído) se muestra un mensaje y se vuelve a la pantalla de login.
+
+---
+
+## 7. Demostración (sustentación)
+
+1. **Flujo completo**: registrar usuario, login, lobby. Dos navegadores distintos se ven entrar y salir en vivo.
+2. **Token inválido**: en DevTools → Application → Local Storage, modificar `token`, recargar el lobby → el coordinador cierra con `4001` y el cliente vuelve al login.
+3. **Token vencido**: poner `JWT_EXPIRES_IN=30s` en `auth-service/.env`, reiniciar el auth, iniciar sesión y esperar 30 s → el coordinador cierra con `4001 "token expired"` y el cliente vuelve al login.
