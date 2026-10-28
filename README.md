@@ -17,11 +17,11 @@ El sistema está formado por tres procesos independientes que se comunican por r
 ```
                          ┌──────────────────────────────┐
                          │        Navegador (x N)       │
-                         │  login / register / lobby    │
+                         │  login.html / lobby.html     │
                          │  token JWT en localStorage   │
                          └───┬──────────┬───────────┬───┘
-            GET /, /login,   │          │           │  WebSocket
-            /lobby, /config.js          │ HTTP POST │  wss://.../connect?token=JWT
+       GET login.html,       │          │           │  WebSocket
+       lobby.html, config.js │          │ HTTP POST │  wss://.../connect?token=JWT
                              │          │ /register │
                              ▼          │ /login    ▼
               ┌──────────────────┐      │     ┌──────────────────────────────┐
@@ -78,11 +78,8 @@ SSD_TALLER_4/
 │   ├── package.json
 │   ├── .env.example
 │   └── public/
-│       ├── index.html
-│       ├── login.html
-│       ├── register.html
-│       ├── lobby.html
-│       ├── common.js
+│       ├── login.html    # dos formularios: iniciar sesión y registrarse
+│       ├── lobby.html    # usuario actual + jugadores en línea (WebSocket)
 │       └── style.css
 ├── .gitignore            # node_modules/, *.db, .env
 └── README.md
@@ -273,9 +270,11 @@ Cada `HEARTBEAT_MS` el coordinador envía `ping`; si un socket no respondió al 
 ### Cliente
 
 - HTML + JS plano, sin frameworks. Los datos de otros jugadores se pintan con `textContent` (nunca `innerHTML`) para evitar XSS con usernames.
-- Login exitoso → token en `localStorage` → redirige a `/lobby`.
+- Dos páginas, siguiendo el esqueleto del enunciado: `login.html` (formularios de login y registro en la misma página) y `lobby.html`. `GET /` redirige a `login.html`.
+- Login exitoso → token en `localStorage` → redirige a `lobby.html`.
 - Botón **Cerrar sesión** → borra el token y cierra el WS.
-- Si el WS se cierra inesperadamente (token inválido/vencido, coordinador caído) se muestra un mensaje y se vuelve a la pantalla de login.
+- Si el WS se cierra inesperadamente (token inválido/vencido, coordinador caído) se muestra un `alert` con el motivo, se borra el token y se vuelve a `login.html`.
+- El token se envía con `encodeURIComponent`: si se "ensucia" con caracteres como `#`, `new WebSocket()` fallaría en el navegador antes de llegar al coordinador y no se vería el rechazo `4001`.
 
 ---
 
