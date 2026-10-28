@@ -113,15 +113,6 @@
         status.classList.add('online');
       };
 
-      // Cada 5 s se reenvía al coordinador el token guardado para que lo vuelva a
-      // verificar: si se corrompe en localStorage, el coordinador cierra con 4001.
-      const TOKEN_CHECK_MS = 5000;
-      const tokenCheck = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'token_check', token: localStorage.getItem('token') }));
-        }
-      }, TOKEN_CHECK_MS);
-
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
         if (msg.type === 'players_update') {
@@ -130,7 +121,6 @@
       };
 
       ws.onclose = (event) => {
-        clearInterval(tokenCheck);
         if (loggingOut) return;
         // 4002: la sesión se abrió en otra pestaña. localStorage se comparte entre
         // pestañas, así que NO se borra el token: lo está usando la otra.
@@ -153,7 +143,6 @@
 
       document.getElementById('logout').addEventListener('click', () => {
         loggingOut = true;
-        clearInterval(tokenCheck);
         localStorage.removeItem('token');
         localStorage.removeItem('username');
         ws.close(1000, 'logout');
