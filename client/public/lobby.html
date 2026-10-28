@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Uber vs Taxi · Lobby</title>
+  <title>Uber vs Taxi · Juego</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚕</text></svg>" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -25,21 +25,37 @@
     </div>
   </nav>
 
-  <main class="container">
-    <div class="card">
+  <main class="container game-layout">
+    <section class="card game-card">
       <div class="lobby-head">
-        <h2>🚦 Jugadores en línea</h2>
-        <span class="count-pill"><span id="count">0</span> en la calle</span>
+        <h2>🗺️ La ciudad</h2>
+        <span class="hint keys">Muévete con <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> o las flechas</span>
       </div>
-      <ul id="players"></ul>
-      <p class="empty hidden" id="empty">Esperando conductores…</p>
-    </div>
-  </main>
+      <!-- Las dimensiones reales las fija el mensaje 'welcome' del coordinador -->
+      <canvas id="world" width="800" height="600" aria-label="Mapa del juego"></canvas>
+    </section>
 
-  <div class="road" aria-hidden="true">
-    <svg class="car car-uber" viewBox="0 0 122 50"><path d="M8 34 Q8 26 16 25 L34 23 L46 12 Q49 9 54 9 L80 9 Q85 9 88 13 L97 23 L108 25 Q114 26 114 32 L114 36 Q114 38 112 38 L10 38 Q8 38 8 36 Z" fill="#2a2d36" stroke="#4a4f5c"/><path d="M38 23 L48 13 Q50 12 53 12 L64 12 L64 23 Z M68 12 L80 12 Q83 12 85 15 L92 23 L68 23 Z" fill="#7fe9c6" opacity=".55"/><rect x="108" y="27" width="6" height="3" rx="1.5" fill="#fff"/><circle cx="30" cy="38" r="9" fill="#0a0a0a"/><circle cx="92" cy="38" r="9" fill="#0a0a0a"/></svg>
-    <svg class="car car-taxi" viewBox="0 0 122 50"><rect x="54" y="1" width="20" height="8" rx="2" fill="#0a0a0a"/><path d="M8 34 Q8 26 16 25 L34 23 L46 12 Q49 9 54 9 L80 9 Q85 9 88 13 L97 23 L108 25 Q114 26 114 32 L114 36 Q114 38 112 38 L10 38 Q8 38 8 36 Z" fill="#ffd54d" stroke="#0a0a0a" stroke-width="1.5"/><path d="M38 23 L48 13 Q50 12 53 12 L64 12 L64 23 Z M68 12 L80 12 Q83 12 85 15 L92 23 L68 23 Z" fill="#1d2230"/><rect x="108" y="27" width="6" height="3" rx="1.5" fill="#fff"/><circle cx="30" cy="38" r="9" fill="#0a0a0a"/><circle cx="92" cy="38" r="9" fill="#0a0a0a"/></svg>
-  </div>
+    <aside class="side-panel">
+      <!-- Feature extra replicado: color del auto + mood (viajan en extras) -->
+      <section class="card">
+        <h2>🎨 Tu auto</h2>
+        <p class="hint">Todos ven tu color y tu mood en vivo.</p>
+        <label>Color</label>
+        <div class="swatches" id="swatches"></div>
+        <label>Mood</label>
+        <div class="moods" id="moods"></div>
+      </section>
+
+      <section class="card">
+        <div class="lobby-head">
+          <h2>🚦 En línea</h2>
+          <span class="count-pill"><span id="count">0</span> en la calle</span>
+        </div>
+        <ul id="players"></ul>
+        <p class="empty hidden" id="empty">Esperando conductores…</p>
+      </section>
+    </aside>
+  </main>
 
   <!-- COORDINATOR_WS viene del .env del cliente (server.js lo sirve como /config.js) -->
   <script src="config.js"></script>
@@ -48,18 +64,43 @@
     const username = localStorage.getItem('username') || '';
     const { COORDINATOR_WS } = window.APP_CONFIG;
 
-    // Color de avatar estable a partir del nombre (solo decorativo)
-    const AVATAR_COLORS = ['#ffc928', '#2ee6a6', '#6aa8ff', '#ff8a5c', '#c79bff', '#ff6fa8'];
-    function avatarFor(name) {
+    // Último 'state' recibido del servidor. Es lo único que se dibuja.
+    // Modificarlo desde DevTools solo cambia ESTA pantalla: el servidor es la
+    // fuente de verdad y lo sobrescribe en el próximo tick (demo de autoridad).
+    let lastState = null;
+    // State anterior + hora de llegada del último: solo para interpolar el dibujo
+    // entre dos posiciones que ya mandó el servidor (no se predice nada).
+    let prevState = null;
+    let lastStateAt = 0;
+    let world = null;   // { width, height, playerRadius, tickRate } desde 'welcome'
+    let myUserId = null;
+
+    const COLORS = ['#ffc928', '#2ee6a6', '#6aa8ff', '#ff8a5c', '#c79bff', '#ff6fa8', '#f4f5f7'];
+    const MOODS = ['', '😎', '🤑', '😡', '😴', '🥳', '🚀'];
+
+    // Color estable a partir del nombre (cuando el jugador no eligió uno)
+    function colorFor(name) {
       let h = 0;
       for (const ch of name) h = (h * 31 + ch.codePointAt(0)) >>> 0;
+      return COLORS[h % (COLORS.length - 1)];
+    }
+    function avatarFor(name) {
       const el = document.createElement('div');
       el.className = 'avatar';
-      el.style.background = AVATAR_COLORS[h % AVATAR_COLORS.length];
+      el.style.background = colorFor(name);
       el.textContent = (name[0] || '?').toUpperCase();
       return el;
     }
 
+    // Los extras los escribe CUALQUIER cliente: se validan antes de usarlos.
+    function safeColor(c) {
+      return typeof c === 'string' && /^#[0-9a-fA-F]{6}$/.test(c) ? c : null;
+    }
+    function safeMood(m) {
+      return typeof m === 'string' ? Array.from(m).slice(0, 2).join('') : '';
+    }
+
+    // ---------- Lista de jugadores (players_update) ----------
     function renderPlayers(players) {
       const ul = document.getElementById('players');
       ul.innerHTML = '';
@@ -74,10 +115,10 @@
         sub.className = 'sub';
         const dot = document.createElement('span');
         dot.className = 'dot';
-        sub.append(dot, 'En línea');
+        sub.append(dot, p.provider === 'google' ? 'Google' : 'Usuario y contraseña');
         text.append(name, sub);
         li.append(avatarFor(p.username), text);
-        if (p.username === username) {
+        if (String(p.userId) === myUserId) {
           li.classList.add('is-me');
           const me = document.createElement('span');
           me.className = 'me';
@@ -88,6 +129,138 @@
       }
       document.getElementById('count').textContent = players.length;
       document.getElementById('empty').classList.toggle('hidden', players.length > 0);
+    }
+
+    // ---------- Canvas ----------
+    const canvas = document.getElementById('world');
+    const ctx = canvas.getContext('2d');
+
+    function drawBackground() {
+      ctx.fillStyle = '#151821';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      // Cuadras de la ciudad: calles cada 200 px con línea central discontinua
+      const STEP = 200;
+      ctx.strokeStyle = '#1f2330';
+      ctx.lineWidth = 40;
+      ctx.beginPath();
+      for (let x = STEP / 2; x < canvas.width; x += STEP) { ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); }
+      for (let y = STEP / 2; y < canvas.height; y += STEP) { ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); }
+      ctx.stroke();
+      ctx.strokeStyle = 'rgba(255, 201, 40, .35)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([14, 14]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    function drawPlayer(p, x, y) {
+      const r = world.playerRadius;
+      const isMe = String(p.userId) === myUserId;
+      const extras = p.extras || {};
+      const color = safeColor(extras.color) || colorFor(p.username);
+
+      if (isMe) {
+        ctx.beginPath();
+        ctx.arc(x, y, r + 6, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(255, 255, 255, .85)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = '#0a0a0a';
+      ctx.stroke();
+
+      // Inicial dentro del círculo
+      ctx.fillStyle = '#0a0a0a';
+      ctx.font = `bold ${Math.round(r * 0.9)}px "Russo One", sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText((p.username[0] || '?').toUpperCase(), x, y + 1);
+
+      // Badge del provider (viene del JWT validado por el servidor, no de extras)
+      const bx = x + r * 0.75, by = y - r * 0.75;
+      ctx.beginPath();
+      ctx.arc(bx, by, 8, 0, Math.PI * 2);
+      ctx.fillStyle = p.provider === 'google' ? '#ffffff' : '#2a2d36';
+      ctx.fill();
+      ctx.font = 'bold 10px Inter, sans-serif';
+      ctx.fillStyle = p.provider === 'google' ? '#4285f4' : '#ffc928';
+      ctx.fillText(p.provider === 'google' ? 'G' : '🔑', bx, by + 1);
+
+      // Nombre + mood. fillText dibuja texto plano: no hay riesgo de XSS.
+      const mood = safeMood(extras.mood);
+      const label = mood ? `${p.username} ${mood}` : p.username;
+      ctx.font = '600 13px Inter, sans-serif';
+      ctx.textBaseline = 'bottom';
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = 'rgba(0, 0, 0, .75)';
+      ctx.strokeText(label, x, y - r - 6);
+      ctx.fillStyle = isMe ? '#ffc928' : '#f4f5f7';
+      ctx.fillText(label, x, y - r - 6);
+    }
+
+    function render() {
+      requestAnimationFrame(render);
+      if (!world) return;
+      drawBackground();
+      if (!lastState) return;
+      // Interpolación de dibujo: avanza de prevState a lastState durante un tick.
+      const alpha = Math.min((performance.now() - lastStateAt) / (1000 / world.tickRate), 1);
+      const prev = new Map(prevState ? prevState.players.map((p) => [p.userId, p]) : []);
+      for (const p of lastState.players) {
+        const a = prev.get(p.userId) || p;
+        drawPlayer(p, a.x + (p.x - a.x) * alpha, a.y + (p.y - a.y) * alpha);
+      }
+    }
+    requestAnimationFrame(render);
+
+    // ---------- Controles del feature extra ----------
+    const EXTRAS_KEY = `extras:${username}`;
+    let myExtras = {};
+    try { myExtras = JSON.parse(localStorage.getItem(EXTRAS_KEY)) || {}; } catch (_) {}
+
+    function buildControls(sendExtras) {
+      const swatches = document.getElementById('swatches');
+      for (const c of COLORS) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'swatch';
+        b.style.background = c;
+        b.title = c;
+        b.addEventListener('click', () => sendExtras({ color: c }));
+        swatches.append(b);
+      }
+      const picker = document.createElement('input');
+      picker.type = 'color';
+      picker.className = 'swatch-picker';
+      picker.title = 'Otro color';
+      picker.addEventListener('input', () => sendExtras({ color: picker.value }));
+      swatches.append(picker);
+
+      const moods = document.getElementById('moods');
+      for (const m of MOODS) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'mood';
+        b.dataset.mood = m;
+        b.textContent = m || '∅';
+        b.title = m ? `Mood ${m}` : 'Sin mood';
+        b.addEventListener('click', () => sendExtras({ mood: m }));
+        moods.append(b);
+      }
+    }
+
+    function markSelected() {
+      for (const b of document.querySelectorAll('.swatch')) {
+        b.classList.toggle('selected', b.title === myExtras.color);
+      }
+      for (const b of document.querySelectorAll('.mood')) {
+        b.classList.toggle('selected', b.dataset.mood === (myExtras.mood || ''));
+      }
     }
 
     // Si el navegador restaura esta página desde su caché de historial (bfcache)
@@ -107,6 +280,59 @@
       // new WebSocket() lanzaría error en vez de dejar que el coordinador lo rechace.
       const ws = new WebSocket(`${COORDINATOR_WS}/connect?token=${encodeURIComponent(token)}`);
 
+      function send(obj) {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+      }
+
+      // extras_update manda el objeto completo: el servidor reemplaza player.extras
+      function sendExtras(patch) {
+        myExtras = { ...myExtras, ...patch };
+        if (!myExtras.mood) delete myExtras.mood;
+        try { localStorage.setItem(EXTRAS_KEY, JSON.stringify(myExtras)); } catch (_) {}
+        send({ type: 'extras_update', extras: myExtras });
+        markSelected();
+      }
+      buildControls(sendExtras);
+      markSelected();
+
+      // ---------- Input: el cliente solo manda INTENCIONES ----------
+      const KEYMAP = {
+        ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down',
+        ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right',
+      };
+      const pressed = new Set();
+      let lastDir = { x: 0, y: 0 };
+
+      function sendIntentIfChanged() {
+        const dir = {
+          x: (pressed.has('right') ? 1 : 0) - (pressed.has('left') ? 1 : 0),
+          y: (pressed.has('down') ? 1 : 0) - (pressed.has('up') ? 1 : 0),
+        };
+        // Solo cuando cambia la dirección: mantener una tecla no genera tráfico
+        if (dir.x === lastDir.x && dir.y === lastDir.y) return;
+        lastDir = dir;
+        send({ type: 'intent', intent: { dir } });
+      }
+
+      window.addEventListener('keydown', (e) => {
+        const k = KEYMAP[e.code];
+        if (!k || e.target.tagName === 'INPUT') return;
+        e.preventDefault(); // que las flechas no hagan scroll
+        pressed.add(k);
+        sendIntentIfChanged();
+      });
+      window.addEventListener('keyup', (e) => {
+        const k = KEYMAP[e.code];
+        if (!k) return;
+        pressed.delete(k);
+        sendIntentIfChanged();
+      });
+      // Si la pestaña pierde el foco no llega el keyup: frenar al jugador
+      window.addEventListener('blur', () => {
+        pressed.clear();
+        sendIntentIfChanged();
+      });
+
       ws.onopen = () => {
         const status = document.getElementById('status');
         status.textContent = 'En línea';
@@ -115,7 +341,18 @@
 
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
-        if (msg.type === 'players_update') {
+        if (msg.type === 'welcome') {
+          world = msg.world;
+          myUserId = String(msg.you.userId);
+          canvas.width = world.width;
+          canvas.height = world.height;
+          // Restaurar el color/mood elegidos antes (si recargó la página)
+          if (Object.keys(myExtras).length) send({ type: 'extras_update', extras: myExtras });
+        } else if (msg.type === 'state') {
+          prevState = lastState;
+          lastState = msg;
+          lastStateAt = performance.now();
+        } else if (msg.type === 'players_update') {
           renderPlayers(msg.players);
         }
       };

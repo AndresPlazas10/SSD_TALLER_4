@@ -364,6 +364,78 @@ button.ghost:hover { border-color: var(--danger); color: var(--danger); filter: 
 }
 .empty { color: var(--muted); text-align: center; padding: 1.5rem 0; margin: 0; }
 
+/* ---------- Login con Google ---------- */
+.card-google { border-top: 3px solid var(--info); margin-top: 1.1rem; }
+.google-btn { margin-top: 1rem; min-height: 44px; display: flex; }
+
+/* ---------- Juego ---------- */
+.game-layout {
+  max-width: 1240px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 1.1rem;
+  align-items: start;
+}
+.game-card { padding: 1rem; }
+.game-card .lobby-head { margin-bottom: .75rem; flex-wrap: wrap; }
+.keys { margin: 0; color: var(--muted); font-size: .85rem; }
+kbd {
+  display: inline-block;
+  min-width: 1.5em;
+  padding: .05rem .35rem;
+  margin: 0 .1rem;
+  border-radius: 5px;
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  background: rgba(8, 9, 12, .7);
+  font: 600 .75rem var(--body);
+  text-align: center;
+  color: var(--text);
+}
+#world {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: #151821;
+}
+.side-panel { display: grid; gap: 1.1rem; }
+.side-panel #players { grid-template-columns: 1fr; }
+
+.swatches, .moods { display: flex; flex-wrap: wrap; gap: .45rem; }
+.swatch, .mood {
+  width: 34px;
+  height: 34px;
+  margin: 0;
+  padding: 0;
+  border-radius: 10px;
+  border: 2px solid transparent;
+  box-shadow: none;
+  cursor: pointer;
+}
+.swatch.selected, .mood.selected { border-color: var(--text); box-shadow: 0 0 0 2px var(--asphalt) inset; }
+.swatch-picker {
+  width: 34px;
+  height: 34px;
+  padding: 2px;
+  border-radius: 10px;
+  cursor: pointer;
+}
+.mood {
+  display: grid;
+  place-items: center;
+  font-size: 1.1rem;
+  color: var(--muted);
+  background: rgba(8, 9, 12, .7);
+  border-color: var(--line);
+}
+.mood.selected { border-color: var(--taxi); }
+
+@media (max-width: 900px) {
+  .game-layout { grid-template-columns: 1fr; }
+}
+
 /* ---------- Carretera decorativa ---------- */
 .road {
   position: fixed;
