@@ -38,7 +38,6 @@ body {
 }
 
 .container { width: 100%; max-width: 880px; position: relative; z-index: 1; padding: 2rem 1rem 0; }
-.container.narrow { max-width: 440px; }
 .hidden { display: none !important; }
 
 /* ---------- Nav superior ---------- */
@@ -79,28 +78,7 @@ body {
   transition: border-color .15s, background .15s, color .15s;
 }
 .nav-btn:hover { border-color: var(--muted); filter: none; }
-.nav-btn[aria-current="page"] { border-color: var(--taxi); color: var(--taxi); }
-.nav-btn.primary {
-  color: var(--uber);
-  border-color: transparent;
-  background: linear-gradient(180deg, #ffd54d, var(--taxi));
-}
-.nav-btn.primary:hover { filter: brightness(1.06); }
-.nav-btn.primary[aria-current="page"] { box-shadow: 0 0 0 2px var(--asphalt), 0 0 0 4px var(--taxi); color: var(--uber); }
 .nav-btn.danger:hover { border-color: var(--danger); color: var(--danger); }
-
-/* ---------- Página de formulario ---------- */
-.form-page h1 {
-  font-family: var(--display);
-  font-weight: 400;
-  text-align: center;
-  font-size: 1.9rem;
-  margin: .5rem 0 .3rem;
-}
-.form-page .lead { text-align: center; color: var(--muted); margin: 0 0 1.4rem; }
-.switch { text-align: center; color: var(--muted); font-size: .9rem; margin: 1.1rem 0 0; }
-.switch a { color: var(--taxi); font-weight: 600; text-decoration: none; }
-.switch a:hover { text-decoration: underline; }
 
 /* ---------- Hero / marca ---------- */
 .hero {

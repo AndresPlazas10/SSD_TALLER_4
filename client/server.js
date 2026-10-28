@@ -8,7 +8,6 @@ const COORDINATOR_WS = process.env.COORDINATOR_WS || 'ws://localhost:5000';
 // URLs públicas (ngrok). Si faltan, se usan las locales.
 const PUBLIC_AUTH_URL = process.env.PUBLIC_AUTH_URL || AUTH_URL;
 const PUBLIC_COORDINATOR_WS = process.env.PUBLIC_COORDINATOR_WS || COORDINATOR_WS;
-const PUBLIC = path.join(__dirname, 'public');
 
 const app = express();
 
@@ -29,17 +28,9 @@ app.get('/config.js', (req, res) => {
   res.send(`window.APP_CONFIG = ${JSON.stringify(config)};`);
 });
 
-// Cada pantalla tiene su propia ruta
-const pages = { '/': 'index.html', '/login': 'login.html', '/register': 'register.html', '/lobby': 'lobby.html' };
-for (const [route, file] of Object.entries(pages)) {
-  app.get(route, (req, res) => {
-    // El lobby depende de la sesión: que el navegador no lo sirva desde caché
-    if (route === '/lobby') res.set('Cache-Control', 'no-store');
-    res.sendFile(path.join(PUBLIC, file));
-  });
-}
-
-app.use(express.static(PUBLIC));
+// Dos páginas: login.html (login + registro) y lobby.html
+app.get('/', (req, res) => res.redirect('/login.html'));
+app.use(express.static(path.join(__dirname, 'public')));
 
 app.listen(PORT, () => {
   console.log(`Cliente en puerto ${PORT}`);
