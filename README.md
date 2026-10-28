@@ -148,12 +148,14 @@ Ningún secreto, puerto ni URL está hardcoded; todo viene de `.env` (cargado co
 |---|---|---|---|
 | auth-service | `PORT` | `4000` | Puerto HTTP |
 | auth-service | `JWT_SECRET` | `...` | Secret para firmar los JWT |
-| auth-service | `JWT_EXPIRES_IN` | `1h` / `30s` | Expiración del token |
+| auth-service | `JWT_EXPIRES_IN` | `1h` / `30s` | Expiración del token (se recarga en caliente al guardar el `.env`) |
 | auth-service | `BCRYPT_ROUNDS` | `10` | Rondas de bcrypt (el servicio no arranca con menos de 10) |
 | auth-service | `DB_FILE` | `users.db` | Archivo SQLite |
 | coordinator | `PORT` | `5000` | Puerto HTTP + WS |
 | coordinator | `JWT_SECRET` | `...` | **La misma** que auth-service |
 | coordinator | `HEARTBEAT_MS` | `30000` | Intervalo de ping/pong |
+| coordinator | `AUTH_URL` | `http://localhost:4000` | Auth del que se lee la duración vigente de los tokens |
+| coordinator | `POLICY_POLL_MS` | `5000` | Cada cuánto se consulta esa duración |
 | client | `PORT` | `3000` | Puerto del servidor estático |
 | client | `AUTH_URL` / `COORDINATOR_WS` | `http://localhost:4000` / `ws://localhost:5000` | URLs locales |
 | client | `PUBLIC_AUTH_URL` / `PUBLIC_COORDINATOR_WS` | `https://...ngrok-free.app` / `wss://...ngrok-free.app` | URLs de ngrok |
@@ -252,7 +254,26 @@ Así un token inválido nunca llega a registrarse como jugador. Para que el nave
 
 ### La sesión WS no dura más que el token
 
-Al aceptar la conexión se programa un temporizador hasta `exp`; al vencer, el coordinador cierra el socket con `4001 "token expired"` y el cliente vuelve al login. Con `JWT_EXPIRES_IN=30s` se reproduce el caso del token vencido en vivo.
+Cada segundo el coordinador revisa las sesiones abiertas y cierra con `4001 "token expired"` las que ya vencieron; el cliente vuelve al login.
+
+### Cambio de `JWT_EXPIRES_IN` en caliente
+
+El auth vigila su `.env` (`fs.watchFile`): al guardarlo con otro `JWT_EXPIRES_IN`, los logins nuevos usan la nueva duración **sin reiniciar el servicio**. Un JWT ya firmado no se puede modificar, así que para las sesiones ya abiertas:
+
+- El auth publica la duración vigente en `GET /token-policy` → `{ "expiresIn": "1m", "expiresInSeconds": 60 }`.
+- El coordinador la consulta cada `POLICY_POLL_MS` (pull: el auth no necesita conocer a los coordinadores, lo que sirve para la futura replicación).
+- Cada sesión vence en `min(exp del token, iat + duración vigente)`; la duración se cuenta desde el login. Ejemplo: alguien entra con `1h`, a los 20 s se cambia a `1m`, y la sesión se cierra al minuto del login (40 s después del cambio). Si ya llevaba más de 1 minuto conectado, se cierra en la siguiente revisión.
+- Recargar con un token emitido antes del cambio tampoco sirve: el `upgrade` aplica la misma regla.
+- Si se aumenta la duración, las sesiones existentes no pasan de la `exp` de su token.
+- Si el auth no responde, el coordinador mantiene la última duración conocida.
+
+### Usernames sin distinguir mayúsculas
+
+`oscar`, `Oscar` y `OSCAR` son el mismo usuario. El auth convierte el username a minúsculas al registrar y al hacer login, y un índice `UNIQUE (username COLLATE NOCASE)` lo garantiza también en SQLite, incluso ante dos registros simultáneos. Registrar `OSCAR` cuando ya existe `oscar` → `409`; hacer login como `OSCAR` entra a la cuenta `oscar`.
+
+### Re-verificación del token cada 5 s
+
+Verificar solo en el `upgrade` no detecta un token que se corrompe **con la sesión ya abierta**. Por eso el lobby envía cada 5 s `{ "type": "token_check", "token": <token de localStorage> }` y el coordinador lo vuelve a verificar con la misma `JWT_SECRET`. Si está corrupto, vencido o pertenece a otro usuario, cierra con `4001` y el cliente vuelve al login. Así, si el token se modifica en `localStorage`, la conexión se cae en máximo 5 s, sin recargar la página.
 
 ### Heartbeat (ping/pong)
 
@@ -281,5 +302,5 @@ Cada `HEARTBEAT_MS` el coordinador envía `ping`; si un socket no respondió al 
 ## 7. Demostración (sustentación)
 
 1. **Flujo completo**: registrar usuario, login, lobby. Dos navegadores distintos se ven entrar y salir en vivo.
-2. **Token inválido**: en DevTools → Application → Local Storage, modificar `token`, recargar el lobby → el coordinador cierra con `4001` y el cliente vuelve al login.
-3. **Token vencido**: poner `JWT_EXPIRES_IN=30s` en `auth-service/.env`, reiniciar el auth, iniciar sesión y esperar 30 s → el coordinador cierra con `4001 "token expired"` y el cliente vuelve al login.
+2. **Token inválido**: en DevTools → Application → Local Storage, modificar `token`, recargar el lobby → el coordinador cierra con `4001` y el cliente vuelve al login. Sin recargar también funciona: en máximo 5 s la re-verificación detecta el token corrupto y cierra la conexión.
+3. **Token vencido**: con una sesión abierta, poner `JWT_EXPIRES_IN=30s` en `auth-service/.env` y guardar (no hace falta reiniciar el auth). La sesión se cierra cuando cumple 30 s desde el login (o en ≤ 6 s si ya los superaba) con `4001 "token expired"`, y el cliente vuelve al login. Los logins nuevos reciben tokens de 30 s.
