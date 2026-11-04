@@ -22,6 +22,7 @@ before(async () => {
       WORLD_WIDTH: String(WORLD.width), WORLD_HEIGHT: String(WORLD.height),
       PLAYER_RADIUS: String(WORLD.radius), PLAYER_SPEED: String(WORLD.speed), TICK_RATE: String(WORLD.tick),
       JWT_CLOCK_TOLERANCE_S: '5', SESSION_MAX_AGE: '', OBSTACLES: 'off', AUTH_URL: '',
+      MATCH_SECONDS: '600', MATCH_BREAK_SECONDS: '10', // rondas largas: no interfieren con los demás tests
     },
     stdio: ['ignore', 'pipe', 'inherit'],
   });
@@ -33,8 +34,8 @@ const sign = (userId, username, opts = {}, provider = 'local', vehicle) =>
   jwt.sign({ userId, username, provider, ...(vehicle ? { vehicle } : {}) }, JWT_SECRET, { expiresIn: '1h', ...opts });
 
 // Cliente de prueba: guarda todos los mensajes y permite esperar uno concreto
-function connect(token) {
-  const ws = new WebSocket(`ws://127.0.0.1:${PORT}/connect?token=${encodeURIComponent(token)}`);
+function connect(token, port = PORT) {
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/connect?token=${encodeURIComponent(token)}`);
   ws.msgs = [];
   ws.closed = new Promise((r) => ws.on('close', (code, reason) => r({ code, reason: reason.toString() })));
   ws.on('message', (d) => ws.msgs.push(JSON.parse(d.toString())));
@@ -167,7 +168,9 @@ test('spam de intents no acelera al jugador ni genera broadcasts extra', async (
 
 test('se queda dentro del mundo (clamp en los 4 bordes)', async () => {
   const ws = connect(sign(7, 'gina'));
-  await ws.waitFor((m) => m.type === 'state');
+  // Solo en el mundo: el auto de un test anterior podría seguir en la esquina
+  // (y ahora los autos chocan entre sí)
+  await ws.waitFor((m) => m.type === 'state' && m.players.length === 1, 3000);
   ws.send({ type: 'intent', intent: { dir: { x: 1, y: 1 } } });
   await sleep(2500);
   const p = me(lastState(ws), '7');
@@ -403,6 +406,8 @@ test('JWT_EXPIRES_IN del auth (GET /token-policy) se aplica a las sesiones abier
     // Token de 1 h: con la política en 1 h la sesión sigue abierta
     const ws = new WebSocket(`ws://127.0.0.1:${port}/connect?token=${encodeURIComponent(sign(24, 'eva'))}`);
     const closed = new Promise((r) => ws.on('close', (code, reason) => r({ code, reason: reason.toString() })));
+    const sessionMsgs = [];
+    ws.on('message', (d) => { const m = JSON.parse(d.toString()); if (m.type === 'session') sessionMsgs.push(m); });
     await new Promise((r) => ws.once('message', r)); // welcome
     await sleep(2200);
     assert.strictEqual(ws.readyState, WebSocket.OPEN);
@@ -412,6 +417,9 @@ test('JWT_EXPIRES_IN del auth (GET /token-policy) se aplica a las sesiones abier
     expiresInSeconds = 2;
     await sleep(1000);
     assert.strictEqual(ws.readyState, WebSocket.OPEN, 'no debe cerrarse al instante');
+    // El cliente recibió el tiempo restante nuevo (para el cronómetro)
+    const nuevo = sessionMsgs.at(-1);
+    assert.ok(nuevo.expiresInMs <= 2000 && nuevo.expiresInMs > 1000, `session.expiresInMs=${nuevo.expiresInMs}`);
     const c = await Promise.race([closed, sleep(3000).then(() => ({ code: 'timeout' }))]);
     assert.deepStrictEqual([c.code, c.reason], [4001, 'token expired']);
     const elapsed = Date.now() - t0;
@@ -448,4 +456,139 @@ test('color por bando: el taxi siempre es amarillo y el Uber no puede usar amari
     assert.strictEqual((await extrasOf('26')).color, ok, `${ok} debería aceptarse`);
   }
   for (const ws of [taxi, uber]) { ws.close(); await ws.closed; }
+});
+
+// Maneja el auto `id` hacia el pasajero hasta recogerlo (mundo sin manzanas)
+async function driveToPassenger(ws, id, ms = 6000) {
+  const t0 = Date.now();
+  let lastDir = '';
+  while (Date.now() - t0 < ms) {
+    const s = lastState(ws);
+    const p = me(s, id);
+    if (p.score >= 1) return;
+    const dir = { x: Math.sign(Math.round(s.passenger.x - p.x)), y: Math.sign(Math.round(s.passenger.y - p.y)) };
+    if (JSON.stringify(dir) !== lastDir) { ws.send({ type: 'intent', intent: { dir } }); lastDir = JSON.stringify(dir); }
+    await sleep(20);
+  }
+}
+
+test('marcador por equipo: suma solo a los conectados; al cerrar sesión se descuenta y al volver arranca en 0', async () => {
+  const uber = connect(sign(27, 'ulla', {}, 'local', 'uber'));
+  const obs = connect(sign(28, 'tomas', {}, 'local', 'taxi'));
+  await obs.waitFor((m) => m.type === 'state' && m.players.length >= 2);
+  await uber.waitFor((m) => m.type === 'state');
+  await driveToPassenger(uber, '27');
+  uber.send({ type: 'intent', intent: { dir: { x: 0, y: 0 } } });
+  const conPunto = await obs.waitFor((m) => m.type === 'state' && me(m, '27') && me(m, '27').score >= 1);
+  assert.strictEqual(conPunto.teams.uber, me(conPunto, '27').score);
+
+  // El Uber cierra sesión: su puntaje deja de contar para el equipo
+  uber.close();
+  await uber.closed;
+  const sinEl = await obs.waitFor((m) => m.type === 'state' && !me(m, '27'));
+  assert.strictEqual(sinEl.teams.uber, 0);
+
+  // Vuelve a entrar: arranca en 0
+  const vuelve = connect(sign(27, 'ulla', {}, 'local', 'uber'));
+  const s = await vuelve.waitFor((m) => m.type === 'state' && me(m, '27'));
+  assert.strictEqual(me(s, '27').score, 0);
+  assert.strictEqual(s.teams.uber, 0);
+  for (const ws of [vuelve, obs]) { ws.close(); await ws.closed; }
+});
+
+test('choque entre autos: al manejar uno contra otro no se superponen', async () => {
+  const a = connect(sign(29, 'ana_c'));
+  const b = connect(sign(30, 'beto_c'));
+  await a.waitFor((m) => m.type === 'state' && me(m, '29') && me(m, '30'));
+  const t0 = Date.now();
+  let lastDir = '';
+  // A persigue a B durante 2,5 s (B quieto): lo alcanza y lo empuja
+  while (Date.now() - t0 < 2500) {
+    const s = lastState(a);
+    const pa = me(s, '29'), pb = me(s, '30');
+    const dir = { x: Math.sign(Math.round(pb.x - pa.x)), y: Math.sign(Math.round(pb.y - pa.y)) };
+    if (JSON.stringify(dir) !== lastDir) { a.send({ type: 'intent', intent: { dir } }); lastDir = JSON.stringify(dir); }
+    await sleep(20);
+  }
+  const states = a.msgs.filter((m) => m.type === 'state' && me(m, '29') && me(m, '30'));
+  const minDist = Math.min(...states.map((s) => Math.hypot(me(s, '29').x - me(s, '30').x, me(s, '29').y - me(s, '30').y)));
+  // 2 * radio = 40 (0,5 px de tolerancia por el redondeo del snapshot)
+  assert.ok(minDist >= 39.5, `los autos se superpusieron: distancia mínima ${minDist.toFixed(1)}`);
+  // Y efectivamente se tocaron (A alcanzó a B)
+  assert.ok(minDist < 41, `A nunca alcanzó a B (distancia mínima ${minDist.toFixed(1)})`);
+  for (const ws of [a, b]) { ws.close(); await ws.closed; }
+});
+
+test('mensaje session: al conectar el cliente recibe cuánto le queda a su sesión', async () => {
+  const ws = connect(sign(31, 'crono')); // token de 1 h
+  const welcomeIdx = await ws.waitFor((m) => m.type === 'welcome').then((w) => ws.msgs.indexOf(w));
+  const s = await ws.waitFor((m) => m.type === 'session');
+  assert.ok(ws.msgs.indexOf(s) > welcomeIdx, 'llega después de welcome');
+  assert.strictEqual(s.reason, 'token expired');
+  assert.ok(Math.abs(s.expiresInMs - 3600 * 1000) < 6000, `expiresInMs=${s.expiresInMs}`);
+  ws.close();
+  await ws.closed;
+});
+
+test('reversa: con reverse:true retrocede sin girar y más lento; cualquier otro valor no es reversa', async () => {
+  const ws = connect(sign(32, 'rita'));
+  await ws.waitFor((m) => m.type === 'state' && me(m, '32'));
+  // Hacia la derecha (este) para quedar mirando al este y lejos del borde izquierdo
+  ws.send({ type: 'intent', intent: { dir: { x: 1, y: 0 } } });
+  await sleep(700);
+  const a = me(await freshState(ws), '32');
+  assert.ok(Math.abs(a.angle) < 1e-6, `mira al este (angle ${a.angle})`);
+  // Reversa hacia el oeste: sigue mirando al este y va a ~60 % de la velocidad
+  ws.send({ type: 'intent', intent: { dir: { x: -1, y: 0 }, reverse: true } });
+  const s1 = await freshState(ws);
+  await sleep(300);
+  const s2 = await freshState(ws);
+  const p1 = me(s1, '32'), p2 = me(s2, '32');
+  assert.ok(Math.abs(p2.angle) < 1e-6, `en reversa no gira (angle ${p2.angle})`);
+  const speed = (p1.x - p2.x) / ((s2.t - s1.t) / 1000);
+  assert.ok(speed > 0.6 * 200 * 0.8 && speed < 0.6 * 200 * 1.2, `retrocede a ~120 px/s (${speed.toFixed(0)})`);
+  // "reverse" que no es exactamente true: avanza normal y gira hacia donde va
+  ws.send({ type: 'intent', intent: { dir: { x: -1, y: 0 }, reverse: 'si' } });
+  await sleep(150);
+  const s3 = await freshState(ws);
+  assert.ok(Math.abs(Math.abs(me(s3, '32').angle) - Math.PI) < 0.01, `sin reversa válida gira al oeste (angle ${me(s3, '32').angle})`);
+  ws.close();
+  await ws.closed;
+});
+
+test('partida: la ronda termina, gana el equipo con más pasajeros, hay podio y la ronda nueva arranca en 0', async () => {
+  const port = PORT + 1003;
+  const env = { ...process.env, PORT: String(port), JWT_SECRET, SESSION_MAX_AGE: '', OBSTACLES: 'off', AUTH_URL: '',
+    WORLD_WIDTH: '400', WORLD_HEIGHT: '300', PLAYER_SPEED: '400', MATCH_SECONDS: '3', MATCH_BREAK_SECONDS: '1' };
+  const other = spawn(process.execPath, [path.join(__dirname, '..', 'index.js')], { cwd: path.join(__dirname, '..'), env, stdio: ['ignore', 'pipe', 'inherit'] });
+  try {
+    await new Promise((resolve) => other.stdout.on('data', (d) => { if (/Coordinador en puerto/.test(d)) resolve(); }));
+    const uber = connect(sign(40, 'u_ronda', {}, 'local', 'uber'), port);
+    const taxi = connect(sign(41, 't_ronda', {}, 'local', 'taxi'), port);
+    const first = await taxi.waitFor((m) => m.type === 'state' && m.players.length >= 2 && m.match);
+    assert.strictEqual(first.match.phase, 'playing');
+    assert.strictEqual(first.match.round, 1);
+    assert.ok(first.match.remainingMs > 0 && first.match.remainingMs <= 3000);
+    await uber.waitFor((m) => m.type === 'state');
+    await driveToPassenger(uber, '40', 2500);
+    uber.send({ type: 'intent', intent: { dir: { x: 0, y: 0 } } });
+
+    const end = await taxi.waitFor((m) => m.type === 'match_end', 4000);
+    assert.strictEqual(end.round, 1);
+    assert.ok(end.teams.uber >= 1 && end.teams.taxi === 0, `marcador ${JSON.stringify(end.teams)}`);
+    assert.strictEqual(end.winner, 'uber');
+    assert.deepStrictEqual(end.top.map((t) => t.username), ['u_ronda']);
+    // En el intermedio el state lleva el resultado y no se recogen pasajeros
+    const pause = await taxi.waitFor((m) => m.type === 'state' && m.match.phase === 'ended');
+    assert.strictEqual(pause.match.result.winner, 'uber');
+
+    await taxi.waitFor((m) => m.type === 'match_start' && m.round === 2, 3000);
+    const r2 = await taxi.waitFor((m) => m.type === 'state' && m.match.round === 2 && m.match.phase === 'playing');
+    assert.deepStrictEqual(r2.players.map((p) => p.score), [0, 0]);
+    assert.deepStrictEqual(r2.teams, { uber: 0, taxi: 0 });
+    for (const ws of [uber, taxi]) { ws.close(); await ws.closed; }
+  } finally {
+    other.kill();
+    await new Promise((r) => (other.exitCode !== null ? r() : other.once('exit', r)));
+  }
 });

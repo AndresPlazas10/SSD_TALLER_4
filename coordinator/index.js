@@ -10,8 +10,27 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 const jwt = require('jsonwebtoken');
 const { buildCity, resolve, collides } = require('./map');
+const { createMesh } = require('./mesh');
 
-const PORT = process.env.PORT || 5000;
+// Varios coordinadores en un mismo equipo comparten el .env: el id y los
+// puertos se pueden pasar por línea de comandos (ver los scripts de package.json):
+//   node index.js --id coord-b --port 5002 --peer-port 5102
+function cliArg(name) {
+  const i = process.argv.indexOf(`--${name}`);
+  return i > 0 ? process.argv[i + 1] : undefined;
+}
+const PORT = parseInt(cliArg('port') || process.env.PORT || '5000', 10);
+// Identidad en el mesh (única): coord-a, coord-b...
+const COORDINATOR_ID = cliArg('id') || process.env.COORDINATOR_ID || `coord-${PORT}`;
+// Puerto del mesh (solo coordinadores), separado del de los jugadores
+const PEER_PORT = parseInt(cliArg('peer-port') || process.env.PEER_PORT || String(PORT + 100), 10);
+// URLs que se anuncian en el directorio. PUBLIC_HOST = IP/host por el que los
+// navegadores llegan a este equipo; PUBLIC_URL / PEER_URL completas las
+// reemplazan (p. ej. un túnel wss:// de ngrok).
+const PUBLIC_HOST = process.env.PUBLIC_HOST || 'localhost';
+const PUBLIC_URL = cliArg('public-url') || process.env.PUBLIC_URL || `ws://${PUBLIC_HOST}:${PORT}`;
+const PEER_URL = cliArg('peer-url') || process.env.PEER_URL || `ws://${PUBLIC_HOST}:${PEER_PORT}`;
+const STARTED_AT = Date.now();
 const JWT_SECRET = process.env.JWT_SECRET;
 const HEARTBEAT_MS = parseInt(process.env.HEARTBEAT_MS || '30000', 10);
 // Auth y coordinador corren en equipos distintos: sus relojes no son idénticos.
@@ -51,8 +70,8 @@ let authPolicyAt = 0;
 let sessionMaxAgeAt = 0;
 
 // Mundo del juego (el cliente lo recibe en 'welcome')
-const WORLD_WIDTH = parseInt(process.env.WORLD_WIDTH || '800', 10);
-const WORLD_HEIGHT = parseInt(process.env.WORLD_HEIGHT || '600', 10);
+const WORLD_WIDTH = parseInt(process.env.WORLD_WIDTH || '2400', 10);
+const WORLD_HEIGHT = parseInt(process.env.WORLD_HEIGHT || '1800', 10);
 const PLAYER_RADIUS = parseInt(process.env.PLAYER_RADIUS || '20', 10);
 const PLAYER_SPEED = parseInt(process.env.PLAYER_SPEED || '200', 10); // px/seg
 const TICK_RATE = parseInt(process.env.TICK_RATE || '20', 10);        // Hz
@@ -60,6 +79,12 @@ const TICK_MS = 1000 / TICK_RATE;
 // OBSTACLES=off deja el mundo vacío (lo usan los tests de movimiento)
 const OBSTACLES = (process.env.OBSTACLES || 'on').trim().toLowerCase() !== 'off';
 const PASSENGER_RADIUS = 10;
+// En reversa el auto va más lento
+const REVERSE_FACTOR = 0.6;
+// Partida por rondas: cada ronda dura MATCH_SECONDS; al terminar gana el
+// equipo con más pasajeros y, tras MATCH_BREAK_SECONDS, empieza otra
+const MATCH_SECONDS = parseInt(process.env.MATCH_SECONDS || '180', 10);
+const MATCH_BREAK_SECONDS = parseInt(process.env.MATCH_BREAK_SECONDS || '10', 10);
 // Límite anti-abuso: ws corta (1009) cualquier mensaje más grande que esto
 // antes de parsearlo, así nadie puede mandar 10 MB.
 const MAX_MESSAGE_BYTES = 4096;
@@ -71,21 +96,78 @@ if (!JWT_SECRET || JWT_SECRET.length < 32) {
 }
 
 const app = express();
-app.get('/health', (req, res) => res.json({ ok: true, players: players.size, tickRate: TICK_RATE }));
+app.get('/health', (req, res) => res.json({
+  ok: true, coordinatorId: COORDINATOR_ID, players: players.size, localPlayers: localCount(), tickRate: TICK_RATE,
+  peers: mesh ? mesh.peerIds() : [], leader: mesh ? mesh.leader() : COORDINATOR_ID,
+}));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_MESSAGE_BYTES });
 
-// userId -> { username, provider, socket, connectedAt, x, y, angle, intent, extras, score }
-// Este Map es la ÚNICA fuente de verdad de las posiciones.
+// userId -> { username, provider, vehicle, owner, socket, connectedAt, x, y, angle, intent, extras, score }
+// Tiene a TODOS los jugadores del mundo: los conectados a este coordinador
+// (socket != null, owner = este) y los de los demás coordinadores (socket =
+// null, owner = su coordinador), que llegan por el mesh.
 const players = new Map();
+const isLocal = (p) => p.socket !== null;
+function localCount() {
+  let n = 0;
+  for (const p of players.values()) if (isLocal(p)) n++;
+  return n;
+}
+// Se crea al final del archivo si hay AUTH_URL (sin directorio, coordinador solo)
+let mesh = null;
 
 // Ciudad: calles y estructuras. Fija mientras viva el proceso.
 const city = buildCity(WORLD_WIDTH, WORLD_HEIGHT, PLAYER_RADIUS);
 if (!OBSTACLES) { city.obstacles = []; city.blocks = []; }
 
-// Pasajeros recogidos por cada equipo mientras viva el proceso
-const teams = { uber: 0, taxi: 0 };
+// Marcador por equipo: la suma de los pasajeros de los conductores CONECTADOS.
+// Se calcula en cada tick a partir del Map: cuando un conductor cierra sesión
+// su puntaje deja de contar, y si vuelve a entrar arranca en 0 (score es del
+// estado de la sesión, no se guarda en ningún lado).
+function teamScores() {
+  const teams = { uber: 0, taxi: 0 };
+  for (const p of players.values()) teams[p.vehicle] += p.score;
+  return teams;
+}
+
+// Choque entre autos: dos autos son círculos de PLAYER_RADIUS y no pueden
+// superponerse. Si se tocan, cada uno retrocede la mitad de lo que se
+// penetraron sobre la línea que une sus centros (un auto en movimiento
+// empuja al otro). Después se los vuelve a sacar de las manzanas y a meter
+// en el mundo. Hasta 8 pasadas: con un auto empujado contra el borde del
+// mundo (que lo devuelve) cada pasada reduce a la mitad lo que se pisan, y
+// así también quedan separados varios autos juntos.
+function separateCars() {
+  const cars = Array.from(players.entries());
+  const min = 2 * PLAYER_RADIUS;
+  for (let pass = 0; pass < 8; pass++) {
+    let moved = false;
+    for (let i = 0; i < cars.length; i++) {
+      for (let j = i + 1; j < cars.length; j++) {
+        const a = cars[i][1], b = cars[j][1];
+        let dx = b.x - a.x, dy = b.y - a.y;
+        let d = Math.hypot(dx, dy);
+        if (d >= min) continue;
+        if (d === 0) {
+          // Misma posición exacta: separar en una dirección fija según el id
+          dx = cars[i][0] < cars[j][0] ? 1 : -1; dy = 0; d = 1;
+        }
+        const push = (min - d) / 2;
+        a.x -= (dx / d) * push; a.y -= (dy / d) * push;
+        b.x += (dx / d) * push; b.y += (dy / d) * push;
+        moved = true;
+      }
+    }
+    for (const [, p] of cars) {
+      [p.x, p.y] = resolve(p.x, p.y, PLAYER_RADIUS, city.obstacles);
+      p.x = Math.max(PLAYER_RADIUS, Math.min(WORLD_WIDTH - PLAYER_RADIUS, p.x));
+      p.y = Math.max(PLAYER_RADIUS, Math.min(WORLD_HEIGHT - PLAYER_RADIUS, p.y));
+    }
+    if (!moved) break;
+  }
+}
 
 // Punto aleatorio donde un círculo de radio r no toca ninguna estructura.
 // avoid: puntos de los que conviene alejarse (p. ej. los autos), si se puede.
@@ -123,6 +205,67 @@ function spawnPassenger() {
 }
 let passenger = spawnPassenger();
 
+// --- Partida Uber vs Taxi ---
+// 'waiting' (nadie conectado) -> 'playing' (ronda en curso) -> 'ended'
+// (ganador en pantalla, no se recogen pasajeros) -> 'playing' (ronda nueva).
+// Todo lo decide el servidor; el cliente solo muestra match en cada state.
+const match = { phase: 'waiting', round: 0, endsAt: 0, result: null };
+
+function startRound(now) {
+  match.round += 1;
+  match.phase = 'playing';
+  match.endsAt = now + MATCH_SECONDS * 1000;
+  match.result = null;
+  for (const p of players.values()) p.score = 0; // cada ronda arranca en 0
+  passenger = spawnPassenger();
+  console.log(`[partida] empieza la ronda ${match.round} (${MATCH_SECONDS} s)`);
+  const event = { type: 'match_start', round: match.round, durationMs: MATCH_SECONDS * 1000 };
+  broadcast(event);
+  if (mesh) { mesh.send({ type: 'match_event', event }); sendWorldSync(); }
+}
+
+function endRound(now) {
+  const teams = teamScores();
+  const winner = teams.uber > teams.taxi ? 'uber' : teams.taxi > teams.uber ? 'taxi' : 'empate';
+  // Podio: los 3 conductores con más pasajeros en la ronda
+  const top = Array.from(players.values())
+    .filter((p) => p.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3)
+    .map((p) => ({ username: p.username, vehicle: p.vehicle, score: p.score }));
+  match.phase = 'ended';
+  match.endsAt = now + MATCH_BREAK_SECONDS * 1000;
+  match.result = { winner, teams, top };
+  console.log(`[partida] fin de la ronda ${match.round}: ${winner} (uber ${teams.uber} - taxi ${teams.taxi})`);
+  const event = { type: 'match_end', round: match.round, ...match.result };
+  broadcast(event);
+  if (mesh) { mesh.send({ type: 'match_event', event }); sendWorldSync(); }
+}
+
+function updateMatch(now) {
+  if (players.size === 0) {
+    // Sin jugadores no corre el reloj: la próxima conexión arranca una ronda
+    match.phase = 'waiting';
+    return;
+  }
+  if (match.phase === 'waiting') startRound(now);
+  else if (now >= match.endsAt) {
+    if (match.phase === 'playing') endRound(now);
+    else startRound(now);
+  }
+}
+
+// Lo que va en cada state: tiempo RESTANTE (no la hora), así el reloj del
+// equipo del cliente no importa
+function matchSnapshot(now) {
+  return {
+    phase: match.phase,
+    round: match.round,
+    remainingMs: Math.max(0, match.endsAt - now),
+    ...(match.phase === 'ended' ? { result: match.result } : {}),
+  };
+}
+
 // Cierra el socket en el primero de estos momentos:
 // - vence el token (exp)                                  -> 'token expired'
 // - duración vigente del auth (JWT_EXPIRES_IN) cumplida    -> 'token expired'
@@ -142,6 +285,16 @@ function scheduleExpiry(ws) {
   if (SESSION_MAX_AGE_S !== null && iat && limitEnd(SESSION_MAX_AGE_S, sessionMaxAgeAt) < deadline) {
     deadline = limitEnd(SESSION_MAX_AGE_S, sessionMaxAgeAt);
     reason = 'session expired';
+  }
+  // Se avisa al cliente cuánto le queda (cronómetro en pantalla). Va el tiempo
+  // RESTANTE y no la hora de cierre: así no importa que el reloj del equipo
+  // del cliente no coincida con el de este equipo.
+  if (ws.readyState === ws.OPEN) {
+    ws.send(JSON.stringify({
+      type: 'session',
+      expiresInMs: deadline === Infinity ? null : Math.max(deadline - Date.now(), 0),
+      reason,
+    }));
   }
   if (deadline === Infinity) return;
   ws.expTimer = setTimeout(() => {
@@ -165,7 +318,7 @@ function reloadSessionMaxAge() {
   console.log(`[config] SESSION_MAX_AGE: ${fmt(SESSION_MAX_AGE_S)} -> ${fmt(next)} (se aplica a ${players.size} sesiones abiertas)`);
   SESSION_MAX_AGE_S = next;
   sessionMaxAgeAt = Date.now();
-  for (const { socket } of players.values()) scheduleExpiry(socket);
+  for (const { socket } of players.values()) if (socket) scheduleExpiry(socket);
 }
 if (!MAX_AGE_FROM_ENV) fs.watchFile(ENV_FILE, { interval: 1000 }, reloadSessionMaxAge);
 
@@ -188,7 +341,7 @@ async function pollTokenPolicy() {
     console.log(`[auth] JWT_EXPIRES_IN: ${fmt(authExpiresInS)} -> ${expiresInSeconds}s (se aplica a ${players.size} sesiones abiertas)`);
     authExpiresInS = expiresInSeconds;
     authPolicyAt = Date.now();
-    for (const { socket } of players.values()) scheduleExpiry(socket);
+    for (const { socket } of players.values()) if (socket) scheduleExpiry(socket);
   } catch (err) {
     if (authReachable !== false) console.error(`[auth] no se pudo consultar ${AUTH_URL}/token-policy (${err.message}); se mantiene la duración anterior`);
     authReachable = false;
@@ -200,10 +353,11 @@ if (AUTH_URL) {
   policyTimer = setInterval(pollTokenPolicy, TOKEN_POLICY_POLL_MS);
 }
 
+// A los clientes de ESTE coordinador (nunca a los pares del mesh)
 function broadcast(obj) {
   const msg = JSON.stringify(obj);
   for (const { socket } of players.values()) {
-    if (socket.readyState === socket.OPEN) socket.send(msg);
+    if (socket && socket.readyState === socket.OPEN) socket.send(msg);
   }
 }
 
@@ -235,6 +389,7 @@ function snapshot() {
 
 // --- Game loop: el ÚNICO lugar donde se mueven los jugadores ---
 let lastTick = Date.now();
+let tickCount = 0;
 
 function tick() {
   const now = Date.now();
@@ -251,10 +406,12 @@ function tick() {
     const iy = p.intent.y;
     const mag = Math.hypot(ix, iy);
     if (mag > 0) {
-      p.angle = Math.atan2(iy, ix); // el auto mira hacia donde avanza
+      // El auto mira hacia donde avanza; en reversa mira al lado contrario
+      // (retrocede sin darse vuelta) y va más lento.
+      p.angle = p.intent.reverse ? Math.atan2(-iy, -ix) : Math.atan2(iy, ix);
       // Substeps de como mucho medio radio: aunque dt sea grande el auto no
       // puede "saltar" a través de la punta de una estructura.
-      const dist = PLAYER_SPEED * dt;
+      const dist = PLAYER_SPEED * (p.intent.reverse ? REVERSE_FACTOR : 1) * dt;
       const steps = Math.max(1, Math.ceil(dist / (PLAYER_RADIUS / 2)));
       for (let s = 0; s < steps; s++) {
         p.x += ((ix / mag) * dist) / steps;
@@ -269,21 +426,43 @@ function tick() {
     }
   }
 
-  // Recogida del pasajero: la decide el servidor, nunca el cliente
+  // Los autos chocan entre sí en vez de atravesarse
+  separateCars();
+
+  // Lo que es de todo el mundo (reloj de la partida, pasajero, puntajes) lo
+  // decide UN coordinador, el líder del mesh; los demás lo reciben por
+  // world_sync. Sin mesh, este coordinador es el líder.
+  const leader = !mesh || mesh.isLeader();
+  if (leader) updateMatch(now);
+
+  // Recogida del pasajero: la decide el servidor, nunca el cliente. Solo
+  // cuenta mientras la ronda está en juego.
   for (const [userId, p] of players) {
+    if (!leader || match.phase !== 'playing') break;
     if (Math.hypot(p.x - passenger.x, p.y - passenger.y) < PLAYER_RADIUS + PASSENGER_RADIUS) {
       p.score += 1;
-      teams[p.vehicle] += 1;
+      const teams = teamScores();
       console.log(`[juego] ${p.username} (${p.vehicle}) recogió al pasajero (${p.score}) | uber ${teams.uber} - taxi ${teams.taxi}`);
-      broadcast({ type: 'pickup', userId, username: p.username, vehicle: p.vehicle, score: p.score });
+      const event = { type: 'pickup', userId, username: p.username, vehicle: p.vehicle, score: p.score };
+      broadcast(event);
       passenger = spawnPassenger();
+      if (mesh) { mesh.send({ type: 'pickup_replicate', event, passenger }); sendWorldSync(); }
       break;
     }
   }
 
+  // Mesh: posiciones de MIS jugadores a 10 Hz (el dueño manda sobre la
+  // posición de sus jugadores) y, si soy el líder, el mundo cada 500 ms
+  tickCount += 1;
+  if (mesh && tickCount % Math.max(1, Math.round(TICK_RATE / 10)) === 0) sendPlayerSync();
+  if (mesh && leader && tickCount % Math.max(1, Math.round(TICK_RATE / 2)) === 0) sendWorldSync();
+
   // Un solo broadcast por tick (nunca uno por cada intent)
   if (players.size > 0) {
-    broadcast({ type: 'state', t: now, players: snapshot(), passenger: roundPoint(passenger), teams });
+    broadcast({
+      type: 'state', t: now, players: snapshot(), passenger: roundPoint(passenger),
+      teams: teamScores(), match: matchSnapshot(now),
+    });
   }
 }
 
@@ -386,18 +565,24 @@ wss.on('connection', (ws, payload) => {
   // Decisión de diseño (ver README): si el usuario ya está conectado,
   // se desconecta la sesión anterior y gana la nueva. La nueva hereda la
   // posición y los extras: es el mismo jugador, no uno nuevo.
+  // (Si la sesión anterior está en OTRO coordinador, ese la cierra al recibir
+  // el player_joined de esta.)
   const existing = players.get(userId);
-  if (existing) {
+  if (existing && existing.socket) {
     console.log(`[ws] ${username} ya estaba conectado: se cierra la sesión anterior`);
     existing.socket.close(4002, 'session replaced');
+  } else if (existing) {
+    console.log(`[ws] ${username} venía de ${existing.owner}: la sesión pasa a este coordinador`);
   }
 
   // Aparece en la calle, nunca dentro de una estructura
-  const spawn = existing || randomFreePoint(PLAYER_RADIUS);
+  // (y lejos de los otros autos, para no aparecer encima de nadie)
+  const spawn = existing || randomFreePoint(PLAYER_RADIUS, Array.from(players.values()), 2 * PLAYER_RADIUS + 10);
   players.set(userId, {
     username,
     provider,
     vehicle,
+    owner: COORDINATOR_ID,
     socket: ws,
     connectedAt: new Date().toISOString(),
     x: spawn.x,
@@ -407,12 +592,15 @@ wss.on('connection', (ws, payload) => {
     extras: existing ? existing.extras : {},
     score: existing ? existing.score : 0,
   });
-  console.log(`[ws] + ${username} [${provider}, ${vehicle}] (${players.size} en línea)`);
+  console.log(`[ws] + ${username} [${provider}, ${vehicle}] (${localCount()} aquí, ${players.size} en el mundo)`);
+  if (mesh) mesh.send(playerJoinedMsg(userId, players.get(userId)));
 
   // El cliente necesita el world para dimensionar el canvas
   ws.send(JSON.stringify({
     type: 'welcome',
     you: { userId, username, provider, vehicle },
+    // A qué coordinador está conectado (el cliente lo muestra)
+    coordinator: { id: COORDINATOR_ID, peers: mesh ? mesh.peerIds() : [] },
     world: {
       width: WORLD_WIDTH, height: WORLD_HEIGHT, playerRadius: PLAYER_RADIUS, tickRate: TICK_RATE,
       passengerRadius: PASSENGER_RADIUS,
@@ -441,8 +629,11 @@ wss.on('connection', (ws, payload) => {
     if (msg.type === 'intent') {
       const dir = msg.intent && msg.intent.dir;
       if (!dir || typeof dir.x !== 'number' || typeof dir.y !== 'number') return;
-      // Sanitizar a -1, 0, 1 - NO confiar en lo que mande el cliente
-      p.intent = { x: Math.sign(dir.x), y: Math.sign(dir.y) };
+      // Sanitizar a -1, 0, 1 - NO confiar en lo que mande el cliente.
+      // reverse es opcional y solo vale si es exactamente true.
+      p.intent = { x: Math.sign(dir.x), y: Math.sign(dir.y), reverse: msg.intent.reverse === true };
+      // Los demás coordinadores aplican el mismo intent a su copia del jugador
+      if (mesh) mesh.send({ type: 'intent_replicate', userId, intent: { dir: { x: p.intent.x, y: p.intent.y }, reverse: p.intent.reverse } });
       return;
     }
 
@@ -452,6 +643,7 @@ wss.on('connection', (ws, payload) => {
       // Se guarda en el estado del jugador: se replica en cada tick mientras
       // dure la sesión (no es un evento puntual).
       p.extras = sanitizeExtras(msg.extras, p.vehicle);
+      if (mesh) mesh.send({ type: 'extras_replicate', userId, extras: p.extras });
       return;
     }
   });
@@ -467,8 +659,9 @@ wss.on('connection', (ws, payload) => {
     const current = players.get(userId);
     if (current && current.socket === ws) {
       players.delete(userId);
-      console.log(`[ws] - ${username} (${players.size} en línea)`);
+      console.log(`[ws] - ${username} (${localCount()} aquí, ${players.size} en el mundo)`);
       broadcastPlayers();
+      if (mesh) mesh.send({ type: 'player_left', userId });
     }
   });
 
@@ -484,11 +677,181 @@ const heartbeat = setInterval(() => {
 }, HEARTBEAT_MS);
 wss.on('close', () => {
   clearInterval(heartbeat);
+  if (mesh) mesh.close();
   clearTimeout(gameLoop);
   fs.unwatchFile(ENV_FILE, reloadSessionMaxAge);
   clearInterval(policyTimer);
 });
 
+// ===================== Mesh (Taller 6) =====================
+// Cada coordinador simula a TODOS los jugadores con los intents que recibe
+// (locales y replicados), pero:
+// - el dueño de un jugador (el coordinador al que está conectado) manda sobre
+//   su posición: la publica a 10 Hz (player_sync) y los demás corrigen su copia;
+// - lo que es de todo el mundo (pasajero, ronda, puntajes) lo decide el líder
+//   y lo publica cada 500 ms y en cada evento (world_sync).
+// Así las copias no se desfasan aunque los ticks de cada proceso no coincidan.
+
+const isFiniteNum = (v) => typeof v === 'number' && Number.isFinite(v);
+const clampX = (x) => Math.max(PLAYER_RADIUS, Math.min(WORLD_WIDTH - PLAYER_RADIUS, x));
+const clampY = (y) => Math.max(PLAYER_RADIUS, Math.min(WORLD_HEIGHT - PLAYER_RADIUS, y));
+
+function playerJoinedMsg(userId, p) {
+  return {
+    type: 'player_joined', userId, username: p.username, provider: p.provider, vehicle: p.vehicle,
+    x: p.x, y: p.y, angle: p.angle, extras: p.extras, score: p.score,
+  };
+}
+
+function sendPlayerSync() {
+  const list = [];
+  for (const [userId, p] of players) {
+    if (isLocal(p)) list.push({ userId, x: Math.round(p.x * 10) / 10, y: Math.round(p.y * 10) / 10, angle: p.angle });
+  }
+  if (list.length) mesh.send({ type: 'player_sync', players: list });
+}
+
+function sendWorldSync() {
+  const scores = {};
+  for (const [userId, p] of players) scores[userId] = p.score;
+  mesh.send({ type: 'world_sync', passenger, match: matchSnapshot(Date.now()), scores });
+}
+
+// Intent replicado: mismas reglas que el de un cliente (-1/0/1, reverse === true)
+function sanitizeIntent(intent) {
+  const dir = intent && intent.dir;
+  if (!dir || !isFiniteNum(dir.x) || !isFiniteNum(dir.y)) return null;
+  return { x: Math.sign(dir.x), y: Math.sign(dir.y), reverse: intent.reverse === true };
+}
+
+function onPeerMessage(msg, peerId) {
+  const userId = typeof msg.userId === 'string' || typeof msg.userId === 'number' ? String(msg.userId) : null;
+  const p = userId ? players.get(userId) : null;
+  // Solo el dueño de un jugador puede moverlo o cambiar sus extras
+  const ownedByPeer = p && p.owner === peerId;
+
+  switch (msg.type) {
+    case 'player_joined': {
+      if (!userId || typeof msg.username !== 'string') return;
+      const vehicle = msg.vehicle === 'uber' ? 'uber' : 'taxi';
+      const prev = players.get(userId);
+      players.set(userId, {
+        username: msg.username.slice(0, 32),
+        provider: msg.provider === 'google' ? 'google' : 'local',
+        vehicle,
+        owner: peerId,
+        socket: null,
+        connectedAt: new Date().toISOString(),
+        x: isFiniteNum(msg.x) ? clampX(msg.x) : PLAYER_RADIUS,
+        y: isFiniteNum(msg.y) ? clampY(msg.y) : PLAYER_RADIUS,
+        angle: isFiniteNum(msg.angle) ? msg.angle : 0,
+        intent: { x: 0, y: 0 },
+        extras: msg.extras && typeof msg.extras === 'object' && !Array.isArray(msg.extras) && JSON.stringify(msg.extras).length <= MAX_EXTRAS_CHARS
+          ? sanitizeExtras(msg.extras, vehicle) : {},
+        score: Number.isInteger(msg.score) && msg.score >= 0 ? msg.score : 0,
+      });
+      // La misma cuenta se abrió en otro coordinador: esta sesión se cierra
+      // (gana la nueva, igual que con dos pestañas en el mismo coordinador)
+      if (prev && prev.socket) {
+        console.log(`[mesh] ${msg.username} abrió sesión en ${peerId}: se cierra la de aquí`);
+        prev.socket.close(4002, 'session replaced');
+      }
+      broadcastPlayers();
+      return;
+    }
+    case 'player_left':
+      if (ownedByPeer) { players.delete(userId); broadcastPlayers(); }
+      return;
+    case 'intent_replicate': {
+      const intent = sanitizeIntent(msg.intent);
+      if (ownedByPeer && intent) p.intent = intent;
+      return;
+    }
+    case 'extras_replicate':
+      if (!ownedByPeer || !msg.extras || typeof msg.extras !== 'object' || Array.isArray(msg.extras)) return;
+      if (JSON.stringify(msg.extras).length > MAX_EXTRAS_CHARS) return;
+      p.extras = sanitizeExtras(msg.extras, p.vehicle);
+      return;
+    case 'player_sync':
+      if (!Array.isArray(msg.players)) return;
+      for (const s of msg.players) {
+        const q = s && players.get(String(s.userId));
+        if (!q || q.owner !== peerId || !isFiniteNum(s.x) || !isFiniteNum(s.y)) continue;
+        q.x = clampX(s.x);
+        q.y = clampY(s.y);
+        if (isFiniteNum(s.angle)) q.angle = s.angle;
+      }
+      return;
+    case 'world_sync':
+      if (peerId !== mesh.leader()) return; // el mundo solo lo decide el líder
+      applyWorld(msg);
+      return;
+    case 'pickup_replicate': {
+      if (peerId !== mesh.leader() || !msg.event || msg.event.type !== 'pickup') return;
+      const q = players.get(String(msg.event.userId));
+      if (q && Number.isInteger(msg.event.score)) q.score = msg.event.score;
+      if (msg.passenger && isFiniteNum(msg.passenger.x) && isFiniteNum(msg.passenger.y)) passenger = { x: msg.passenger.x, y: msg.passenger.y };
+      broadcast(msg.event); // el aviso de "X recogió al pasajero" a mis clientes
+      return;
+    }
+    case 'match_event':
+      if (peerId !== mesh.leader() || !msg.event || !['match_start', 'match_end'].includes(msg.event.type)) return;
+      broadcast(msg.event);
+      return;
+    default:
+  }
+}
+
+function applyWorld(msg) {
+  if (msg.passenger && isFiniteNum(msg.passenger.x) && isFiniteNum(msg.passenger.y)) {
+    passenger = { x: msg.passenger.x, y: msg.passenger.y };
+  }
+  const m = msg.match;
+  if (m && ['waiting', 'playing', 'ended'].includes(m.phase) && Number.isInteger(m.round) && isFiniteNum(m.remainingMs)) {
+    match.phase = m.phase;
+    match.round = m.round;
+    match.endsAt = Date.now() + m.remainingMs; // relativo: no depende del reloj del líder
+    match.result = m.phase === 'ended' && m.result ? m.result : null;
+  }
+  if (msg.scores && typeof msg.scores === 'object') {
+    for (const [userId, score] of Object.entries(msg.scores)) {
+      const q = players.get(userId);
+      if (q && Number.isInteger(score) && score >= 0) q.score = score;
+    }
+  }
+}
+
+function onPeerUp(peerId) {
+  // Al par nuevo le cuento quiénes están conectados aquí y, si soy el líder,
+  // cómo está el mundo
+  for (const [userId, p] of players) if (isLocal(p)) mesh.sendTo(peerId, playerJoinedMsg(userId, p));
+  if (mesh.isLeader()) sendWorldSync();
+}
+
+function onPeerDown(peerId) {
+  // Se cayó un coordinador: sus jugadores se desconectaron (se reconectan a
+  // otro coordinador y vuelven a aparecer con su player_joined)
+  let removed = 0;
+  for (const [userId, p] of players) {
+    if (p.owner === peerId) { players.delete(userId); removed++; }
+  }
+  if (removed) {
+    console.log(`[mesh] ${removed} jugador(es) de ${peerId} quedaron desconectados`);
+    broadcastPlayers();
+  }
+}
+
+if (AUTH_URL && (process.env.MESH || 'on').trim().toLowerCase() !== 'off') {
+  mesh = createMesh({
+    id: COORDINATOR_ID, peerPort: PEER_PORT, publicUrl: PUBLIC_URL, peerUrl: PEER_URL,
+    authUrl: AUTH_URL, secret: JWT_SECRET, startedAt: STARTED_AT,
+    getConnectedPlayers: localCount,
+    onMessage: onPeerMessage, onPeerUp, onPeerDown,
+  });
+}
+
 server.listen(PORT, () => {
-  console.log(`Coordinador en puerto ${PORT} (game loop a ${TICK_RATE} Hz, mundo ${WORLD_WIDTH}x${WORLD_HEIGHT}, ${city.obstacles.length} estructuras)`);
+  console.log(`Coordinador en puerto ${PORT} (${COORDINATOR_ID}, game loop a ${TICK_RATE} Hz, mundo ${WORLD_WIDTH}x${WORLD_HEIGHT}, ${city.obstacles.length} estructuras)`);
+  if (mesh) console.log(`  mesh: pares en ${PEER_URL}, clientes en ${PUBLIC_URL}, directorio ${AUTH_URL}`);
+  else console.log('  sin AUTH_URL: funciona solo (sin directorio ni mesh)');
 });

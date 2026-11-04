@@ -5,7 +5,10 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node --test"
+    "start:a": "node index.js --id coord-a --port 5001 --peer-port 5101",
+    "start:b": "node index.js --id coord-b --port 5002 --peer-port 5102",
+    "start:c": "node index.js --id coord-c --port 5003 --peer-port 5103",
+    "test": "node --test --test-concurrency=1"
   },
   "keywords": [],
   "author": "",
