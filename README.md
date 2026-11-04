@@ -1,8 +1,8 @@
-# SSD Taller 5 — Proyecto Final Parte II: Juego en vivo + Login con Google
+# SSD Taller 6 — Proyecto Final Parte III: coordinadores en mesh (sobre la Parte II: juego en vivo + login con Google)
 
-Videojuego web multijugador **Uber vs Taxi** del curso de Sistemas Distribuidos. La Parte I (Taller 4) dejó registro, login con JWT y lobby en tiempo real. Esta Parte II agrega:
+Videojuego web multijugador **Uber vs Taxi** del curso de Sistemas Distribuidos. La Parte I (Taller 4) dejó registro, login con JWT y lobby en tiempo real. La **Parte III (Taller 6)** reparte el juego entre **varios coordinadores en mesh** (sección 0). La Parte II agregó:
 
-- **El juego en vivo**: los jugadores se mueven en un `<canvas>` y todos ven a todos en tiempo real. **El servidor es la autoridad**: el cliente solo manda intenciones de movimiento y dibuja lo que el coordinador le dice.
+- **El juego en vivo**: los jugadores se mueven en una ciudad en 3D (`<canvas>` WebGL con Three.js) y todos ven a todos en tiempo real. **El servidor es la autoridad**: el cliente solo manda intenciones de movimiento y dibuja lo que el coordinador le dice.
 - **Login con Google** (Google Identity Services): convive con usuario/contraseña en **una sola tabla `users`** y ambos métodos producen **el mismo JWT**.
 - **Feature extra replicado**: color del auto + mood (emoji), vía `extras`. Además, un badge del provider (local / Google).
 
@@ -10,9 +10,126 @@ El sistema son tres procesos independientes que corren en **tres equipos distint
 
 | Componente | Carpeta | Equipo | Puerto | Tecnología | Responsabilidad |
 |---|---|---|---|---|---|
-| Servicio de Autenticación | `auth-service/` | **A** | 4000 | Express + `node:sqlite` + bcrypt + JWT + `google-auth-library` | Registro, login local, login con Google, emitir JWT |
-| Coordinador | `coordinator/` | **B** | 5000 | Express + `ws` + JWT | Validar el JWT, estado autoritativo del juego, game loop a 20 Hz |
-| Cliente Web | `client/` | **C** | 3000 | HTML + JS plano (servido con Express) | Login/registro/Google, canvas del juego, input |
+| Servicio de Autenticación | `auth-service/` | **A** | 4000 | Express + `node:sqlite` + bcrypt + JWT + `google-auth-library` | Registro, login local, login con Google, emitir JWT y **directorio de coordinadores** |
+| Coordinador (uno o **varios en mesh**) | `coordinator/` | **B** | 5000 (o 5001-5003 + mesh 5101-5103) | Express + `ws` + JWT | Validar el JWT, estado autoritativo del juego, game loop a 20 Hz, replicación entre coordinadores |
+| Cliente Web | `client/` | **C** | 3000 | HTML + JS plano (servido con Express) | Login/registro/Google, vista 3D del juego (Three.js), input |
+
+---
+
+## 0. Parte III (Taller 6): varios coordinadores en mesh
+
+Hasta el Taller 5 había **un solo coordinador**: si se caía, se acababa el juego para todos, y todas las conexiones WS iban al mismo proceso. Ahora:
+
+- Corren **varios coordinadores en paralelo**, intercambiables, todos con el mismo estado del juego.
+- **El auth también es el directorio**: los coordinadores se anuncian con heartbeats y el cliente le pregunta a cuál conectarse, el **menos cargado**. Es *client-side load balancing*: el auth no reenvía tráfico, solo dice a dónde ir.
+- **Los coordinadores forman un mesh por WebSocket** (todos con todos) y se replican entre sí. Si Alice está en coord-a y se mueve, Bob, en coord-b, la ve moverse.
+- **El cliente muestra a qué coordinador está conectado** y, si ese coordinador se cae, pide otro al directorio y se reconecta solo.
+
+```
+                       ┌──────────────── auth-service (A) :4000 ────────────────┐
+                       │  /register /login /auth/google   (Parte I y II)        │
+                       │  POST /heartbeat  GET /coordinator  GET /peers (mesh)  │
+                       └───▲───────────────────▲───────────────────▲────────────┘
+            heartbeat 2 s  │ + /peers          │                   │
+        ┌──────────────────┴──┐   ┌────────────┴────────┐   ┌──────┴──────────────┐
+        │ coord-a  :5001      │◀─▶│ coord-b  :5002      │◀─▶│ coord-c  :5003      │
+        │ mesh     :5101      │   │ mesh     :5102      │   │ mesh     :5103      │
+        └──────▲──────────────┘   └──────────▲──────────┘   └─────────▲───────────┘
+               │ WS (juego)                  │                        │
+            Alice                          Bob                     Carla
+   (1) login → (2) GET /coordinator → (3) WS al coordinador asignado
+```
+
+### 0.1 Endpoints nuevos del auth (directorio)
+
+| Método | Ruta | Quién lo llama | Respuesta |
+|---|---|---|---|
+| POST | `/heartbeat` | Cada coordinador, cada 2 s | `200 { ok: true }`. Body: `{ coordinatorId, publicUrl, peerUrl, connectedPlayers, uptime }` |
+| GET | `/coordinator` | El cliente, después del login | `200 { coordinatorId, publicUrl }` (el menos cargado) o `503 { error: "no_coordinators_available" }` |
+| GET | `/peers` | Cada coordinador, cada 2 s | `200 { peers: [{ coordinatorId, peerUrl }] }` (cada uno se filtra a sí mismo) |
+| GET | `/coordinators` | Depuración | Lista de vivos con `connectedPlayers`, `uptime` y hace cuánto fue su último heartbeat |
+
+- El auth guarda en memoria un `Map<coordinatorId, { ...info, lastSeen }>`. Un coordinador con **más de 6 s sin heartbeat** (3 ciclos) se descarta y ya no aparece en `/coordinator` ni en `/peers` (`DIRECTORY_TTL_MS=6000`).
+- **Selección**: el de menos `connectedPlayers` entre los vivos; en empate, el primero. Si llegan varios clientes en el mismo segundo, el auth **cuenta las asignaciones que hizo** hasta el próximo heartbeat (que trae la cifra real). Si no, los 4 clientes que entran juntos irían todos al mismo, porque su `connectedPlayers` todavía dice 0.
+- `?exclude=coord-x`: el cliente lo usa para no volver al coordinador que se le acaba de caer.
+- **Seguridad**: `/heartbeat` y `/peers` exigen `Authorization: Bearer <JWT>` firmado con la `JWT_SECRET` compartida y `{ role: "coordinator" }`. Un coordinador solo puede anunciarse a sí mismo (el `coordinatorId` del body debe coincidir con el del token). Sin esto, cualquiera podría registrar un "coordinador" falso y desviar a los jugadores. `/coordinator` es público porque lo llama el navegador.
+- Validaciones: `coordinatorId` de 1 a 64 caracteres (`[A-Za-z0-9_-]`), `publicUrl` y `peerUrl` `ws://` o `wss://`, `connectedPlayers` entero ≥ 0 y `uptime` ≥ 0 (si no, `400`).
+
+### 0.2 El mesh (`coordinator/mesh.js`)
+
+Cada coordinador escucha a los **jugadores** en `PORT` y a los **otros coordinadores** en `PEER_PORT`, un puerto distinto para separar el tráfico.
+
+- **Descubrimiento**: cada 2 s, heartbeat al auth y `GET /peers`. Por cada par nuevo abre una conexión WS a su `peerUrl`.
+- **Una sola conexión por par**: inicia la conexión **solo el de `coordinatorId` menor** (orden lexicográfico); el otro espera. Si aun así llega una duplicada (ya hay conexión con ese par), se cierra la nueva (`4009`).
+- **Handshake**: el primer mensaje de cada lado es `{ type: "hello", coordinatorId, startedAt, auth }`, donde `auth` es un JWT de coordinador. Sin un hello válido en 5 s, se cierra (`4008` / `4003`). Así un proceso cualquiera no puede entrar al mesh a inyectar movimientos.
+- **Sin bucles**: todo mensaje lleva `origin`. Se descarta lo que tenga `origin` propio y lo que no venga directamente de su origen: **nadie retransmite**, porque cada coordinador manda a todos sus pares.
+- **Caídas**: ping entre pares cada 2 s. Si un coordinador muere (Ctrl+C), sus pares lo notan al instante (se cierra el socket) o en ~2 ciclos de ping si se colgó la red. Entonces borran a los jugadores de ese coordinador.
+
+**Mensajes** (los cuatro primeros son los del enunciado):
+
+| Mensaje | Cuándo | Qué hace quien lo recibe |
+|---|---|---|
+| `player_joined` `{ origin, userId, username, x, y, provider, vehicle, angle, extras, score }` | Un jugador se conecta a `origin` (y al conectarse un par nuevo: los que ya están) | Agrega al jugador como **remoto** (dueño = `origin`). Si ese usuario estaba conectado **aquí**, cierra su sesión local con `4002` |
+| `player_left` `{ origin, userId }` | Un jugador se desconecta | Lo borra, solo si su dueño es `origin` |
+| `intent_replicate` `{ origin, userId, intent: { dir, reverse? } }` | El jugador manda un intent | Lo aplica a su copia del jugador, con las mismas reglas (−1/0/1, `reverse === true`) y solo si `origin` es su dueño. **No lo retransmite** |
+| `extras_replicate` `{ origin, userId, extras }` | El jugador cambia color o mood | Igual, con la misma validación (`sanitizeExtras`, ≤ 1 KB) |
+| `player_sync` `{ origin, players: [{ userId, x, y, angle }] }` | 10 veces por segundo | Corrige la posición de los jugadores de `origin` |
+| `world_sync` `{ origin, passenger, match, scores }` | El líder, cada 500 ms y en cada evento | Adopta el pasajero, la ronda y los puntajes |
+| `pickup_replicate` / `match_event` | El líder: recogida, inicio o fin de ronda | Avisa a sus clientes (`pickup`, `match_start`, `match_end`) |
+
+### 0.3 Consistencia: quién manda sobre qué
+
+Cada coordinador corre su propio game loop a 20 Hz con **todos** los jugadores del mundo (locales y remotos), aplicando los intents que recibe. Hace broadcast del `state` **solo a sus clientes**; nunca a los pares. Pero dos procesos nunca hacen sus ticks en el mismo instante, así que si cada uno solo simulara, las posiciones se desfasarían de a poco. Por eso hay dos reglas:
+
+1. **El dueño de un jugador manda sobre su posición.** El coordinador al que está conectado publica 10 veces por segundo su posición real (`player_sync`), y los demás corrigen su copia. Entre una sincronización y otra la copia avanza con el intent replicado, así que se ve fluida. Los choques entre autos los resuelve cada dueño para sus propios autos.
+2. **Lo que es de todo el mundo lo decide un líder**: el pasajero, quién lo recoge, el reloj de la ronda, el ganador y los puntajes. El líder es el coordinador vivo que **arrancó primero** (`startedAt` menor; en empate, el id menor). Todos lo calculan igual porque `startedAt` viaja en el `hello`. Un coordinador que entra después **nunca le quita el puesto** al que ya llevaba la partida (si el líder fuera simplemente "el id menor", al levantar un coord-a nuevo se reiniciaría la ronda). Si el líder se cae, el siguiente más antiguo continúa con su copia del mundo.
+
+El resultado, comprobado en el test de integración: Alice tiene **la misma posición** en el `state` de coord-a y en el de coord-b, y los dos ven el mismo pasajero y la misma ronda.
+
+**Sesión que cambia de coordinador**: si alguien abre su cuenta en coord-c estando conectado a coord-a, coord-c manda `player_joined` y coord-a cierra la sesión vieja con `4002`, igual que con dos pestañas en un mismo coordinador. La sesión nueva **hereda la posición**, porque coord-c ya tenía la copia replicada del jugador.
+
+### 0.4 Cliente
+
+1. Después del login, el lobby pide `GET /coordinator` al auth y abre el WS al `publicUrl` que le devuelve.
+2. Muestra a qué coordinador está conectado, en la barra superior ("En línea · coord-b") y dentro del juego (**🖧 Coordinador: coord-b · 20 Hz**). El `welcome` del coordinador confirma su id.
+3. Si el WS se cae por algo que no es el token (`4001`) ni otra pestaña (`4002`), **no** vuelve directo al mismo coordinador: avisa "Se perdió coord-b…", pide `GET /coordinator?exclude=coord-b` y se conecta al que le digan. **La sesión sigue**, sin pasar por el login. Si no hay coordinadores vivos (`503`), reintenta cada 2 s.
+
+### 0.5 Levantar tres coordinadores
+
+En un solo equipo (desarrollo), con el `.env` de siempre, cada coordinador toma su id y sus puertos de la línea de comandos:
+
+```bash
+cd auth-service && npm start             # directorio en :4000
+cd coordinator  && npm run start:a       # coord-a: jugadores :5001, mesh :5101
+cd coordinator  && npm run start:b       # coord-b: jugadores :5002, mesh :5102
+cd coordinator  && npm run start:c       # coord-c: jugadores :5003, mesh :5103
+cd client       && npm start             # :3000
+```
+
+En la consola de cada coordinador se ve `[mesh] conectado con coord-b (2 pares; líder: coord-a)`, y en la del auth `[directorio] + coord-a (...)`. Para revisarlo:
+- `http://localhost:4000/coordinators`: los vivos y su carga;
+- `http://localhost:5002/health`: pares y líder de coord-b.
+
+En **equipos distintos**, cada coordinador usa en su `.env` `COORDINATOR_ID` (único), `PEER_PORT` y `PUBLIC_HOST=<su IP LAN>`, para que anuncie `ws://<IP>:PORT` a los navegadores y `ws://<IP>:PEER_PORT` a los otros coordinadores. Además hay que **abrir en el firewall** `PORT` y `PEER_PORT`. Con ngrok, cada coordinador anuncia su túnel con `PUBLIC_URL=wss://...`.
+
+| Variable (coordinador) | Ejemplo | Descripción |
+|---|---|---|
+| `COORDINATOR_ID` / `--id` | `coord-b` | Identificador único en el mesh |
+| `PORT` / `--port` | `5002` | WS de los jugadores |
+| `PEER_PORT` / `--peer-port` | `5102` | WS de los otros coordinadores (por defecto `PORT + 100`) |
+| `PUBLIC_HOST` | `192.168.1.11` | Host con el que se arman `publicUrl` y `peerUrl` |
+| `PUBLIC_URL` / `PEER_URL` | `wss://….ngrok-free.app` | URLs completas, si no sirven las armadas con `PUBLIC_HOST` |
+| `AUTH_URL` | `http://192.168.1.10:4000` | Directorio. **Vacío = coordinador solo**, sin mesh: es como corren los tests del Taller 5 |
+
+### 0.6 Guion de la sustentación (Taller 6)
+
+1. **Tres coordinadores en `/peers`**: levantar `start:a`, `start:b` y `start:c`. Mostrar `http://localhost:4000/coordinators` con los tres vivos. `/peers` necesita token de coordinador; el test `coordinator/test/mesh.test.js` lo consulta tal cual.
+2. **Reparto de 4 clientes**: abrir 4 pestañas o ventanas de incógnito con usuarios distintos. Cada una muestra su coordinador, por ejemplo `coord-a, coord-b, coord-c, coord-a`, y `/coordinators` muestra la carga.
+3. **Alice y Bob en coordinadores distintos**: cada pestaña muestra el suyo (🖧). Mover a Alice: Bob la ve en vivo, y al revés.
+4. **Ctrl+C a un coordinador**:
+   - (a) sus clientes pierden la conexión ("Se perdió coord-b…");
+   - (b) pasados 6 s, `/coordinators` y `/coordinator` ya no lo devuelven;
+   - (c) esos clientes se reconectan solos a un coordinador vivo y los demás los vuelven a ver.
 
 ---
 
@@ -22,7 +139,7 @@ El sistema son tres procesos independientes que corren en **tres equipos distint
                             ┌─────────────────────────────────────┐
                             │           Navegador (x N)            │
                             │  login.html ─ botón oficial Google   │
-                            │  lobby.html ─ canvas + lastState     │
+                            │  lobby.html ─ 3D + lastState         │
                             └──┬───────────────┬────────────────┬──┘
          GET páginas y         │               │ HTTP           │ WebSocket
          /config.js            │               │ POST /register │ /connect?token=JWT
@@ -72,7 +189,7 @@ SSD_TALLER_4/
 │   ├── .env.example
 │   └── public/
 │       ├── login.html      # login, registro y "Entrar con Google" (+ elegir username)
-│       ├── lobby.html      # canvas del juego, controles del feature extra, jugadores en línea
+│       ├── lobby.html      # vista 3D del juego, controles del feature extra, jugadores en línea
 │       └── style.css
 ├── .gitignore              # node_modules/, *.db, .env
 └── README.md
@@ -141,14 +258,14 @@ copy .env.example .env
 # editar .env: EXACTAMENTE la misma JWT_SECRET del equipo A
 #              AUTH_URL=http://<IP-equipo-A>:4000
 npm start
-# → Coordinador en puerto 5000 (game loop a 20 Hz, mundo 800x600)
+# → Coordinador en puerto 5000 (game loop a 20 Hz, mundo 2400x1800, 108 estructuras)
 ```
 
 ### Paso 3 — Equipo C: client (puerto 3000)
 
 ```bash
 cd SSD_TALLER_4/client
-npm install
+npm install            # instala express, dotenv y three (vista 3D, versión fija)
 copy .env.example .env
 # editar .env:
 #   AUTH_URL=http://<IP-equipo-A>:4000
@@ -220,10 +337,11 @@ Ningún secreto, puerto ni URL está hardcodeado; todo viene de `.env` (`dotenv`
 | B | coordinator | `AUTH_URL` | `http://192.168.1.10:4000` | URL del auth: el coordinador consulta su `/token-policy` para aplicar `JWT_EXPIRES_IN` a las sesiones abiertas (vacío = desactivado) |
 | B | coordinator | `TOKEN_POLICY_POLL_MS` | `1000` | Cada cuánto se consulta `/token-policy` |
 | B | coordinator | `HEARTBEAT_MS` | `30000` | Intervalo de ping/pong |
-| B | coordinator | `WORLD_WIDTH` / `WORLD_HEIGHT` | `800` / `600` | Tamaño del mundo |
+| B | coordinator | `WORLD_WIDTH` / `WORLD_HEIGHT` | `2400` / `1800` | Tamaño del mundo en px: una manzana cada 200 px (12 × 9 = 108 manzanas) |
 | B | coordinator | `PLAYER_RADIUS` | `20` | Radio del jugador |
 | B | coordinator | `PLAYER_SPEED` | `200` | px/seg |
 | B | coordinator | `TICK_RATE` | `20` | Hz del game loop |
+| B | coordinator | `MATCH_SECONDS` / `MATCH_BREAK_SECONDS` | `180` / `10` | Duración de cada ronda de la partida Uber vs Taxi y pausa entre rondas (s) |
 | B | coordinator | `OBSTACLES` | `on` / `off` | Estructuras de la ciudad con colisión (`off` = mundo vacío, lo usan los tests) |
 | C | client | `PORT` | `3000` | Puerto del servidor estático |
 | C | client | `AUTH_URL` / `COORDINATOR_WS` | `http://192.168.1.10:4000` / `ws://192.168.1.11:5000` | URLs LAN (cliente abierto por localhost) |
@@ -356,9 +474,12 @@ Conexión: `ws(s)://<coordinador>/connect?token=<JWT>`. El JWT se valida en el `
 | Mensaje | Cuándo | Contenido |
 |---|---|---|
 | `welcome` | Al conectar | `{ type, you: { userId, username, provider, vehicle }, world: { width, height, playerRadius, tickRate, passengerRadius, cell, sidewalk, obstacles, blocks } }` |
-| `state` | Cada tick (20 Hz) | `{ type, t, players: [{ userId, username, provider, vehicle, x, y, angle, score, extras }], passenger: { x, y }, teams: { uber, taxi } }` |
+| `state` | Cada tick (20 Hz) | `{ type, t, players: [{ userId, username, provider, vehicle, x, y, angle, score, extras }], passenger: { x, y }, teams: { uber, taxi }, match: { phase, round, remainingMs, result? } }` (`teams` = suma de los puntajes de los conectados; `match` = ronda en curso, ver 8.1) |
 | `players_update` | Alguien entra o sale | `{ type, players: [{ userId, username, provider, vehicle }] }` (lista del lobby) |
 | `pickup` | Un auto recoge al pasajero | `{ type, userId, username, vehicle, score }` (para el aviso en pantalla) |
+| `match_start` | Empieza una ronda | `{ type, round, durationMs }` |
+| `match_end` | Termina una ronda | `{ type, round, winner: "uber"\|"taxi"\|"empate", teams, top: [{ username, vehicle, score }] }` (podio de hasta 3) |
+| `session` | Al conectar y cada vez que cambia la duración (`JWT_EXPIRES_IN` / `SESSION_MAX_AGE` en caliente) | `{ type, expiresInMs, reason }`: milisegundos que le quedan a la sesión antes del cierre `4001` (`null` = sin límite). Va el tiempo **restante**, no la hora, así no depende de que los relojes de los equipos coincidan. El cliente lo muestra como cronómetro ⏱ (amarillo en el último minuto, rojo en los últimos 10 s) |
 
 `obstacles` es la lista de lo que choca: un rectángulo `{ kind: "poly", name, points: [[x, y], …] }` por manzana (la colisión también soporta `{ kind: "circle", x, y, r }` y polígonos cóncavos). `blocks` describe qué hay dentro de cada manzana (`type`: `casas`, `conjunto`, `edificio` o `parque`, con sus `houses`, `building` o `trees`) y es **solo decoración**. Las colisiones las resuelve el coordinador.
 
@@ -366,7 +487,7 @@ Conexión: `ws(s)://<coordinador>/connect?token=<JWT>`. El JWT se valida en el `
 
 | Mensaje | Contenido | Qué hace el servidor |
 |---|---|---|
-| `intent` | `{ type: "intent", intent: { dir: { x: -1\|0\|1, y: -1\|0\|1 } } }` | Guarda `p.intent = { x: Math.sign(x), y: Math.sign(y) }`. **No mueve ni hace broadcast.** |
+| `intent` | `{ type: "intent", intent: { dir: { x: -1\|0\|1, y: -1\|0\|1 }, reverse?: true } }` | Guarda `p.intent = { x: Math.sign(x), y: Math.sign(y), reverse: reverse === true }`. **No mueve ni hace broadcast.** `reverse` solo vale si es exactamente `true`: el auto retrocede sin girar, al 60 % de la velocidad. |
 | `extras_update` | `{ type: "extras_update", extras: { color: "#ff5500", mood: "😎" } }` | Si es un objeto (no array) de ≤ 1024 caracteres serializado, lo guarda en `p.extras`. Se replica en el próximo `state`. |
 
 **Códigos de cierre**: `4001 "invalid token"` / `4001 "token expired"` / `4001 "session expired"`, `4002 "session replaced"`, `1009` (mensaje > 4 KB).
@@ -401,13 +522,16 @@ El código de arriba es la versión base. Con la ciudad, `tick()` además:
 
 - **Divide el movimiento en substeps** de como mucho medio radio y, después de cada uno, saca al auto de cualquier estructura que toque (`resolve` en `coordinator/map.js`). Así el auto no puede atravesar la punta de un triángulo aunque `dt` sea grande.
 - **Guarda `angle`** (`atan2` del intent) para que el cliente dibuje el auto mirando hacia donde avanza.
-- **Revisa si algún auto llegó al pasajero**. Si es así, le suma 1 punto a ese jugador y a su equipo (`teams.uber` / `teams.taxi`), manda `pickup` a todos y ubica al pasajero en otro lugar.
+- **Reversa**: si el intent trae `reverse`, el auto se mueve en esa dirección pero **sigue mirando al lado contrario** (retrocede sin darse vuelta) y va al 60 % de `PLAYER_SPEED`.
+- **Separa los autos que se tocan** (`separateCars`): dos autos no pueden superponerse (ver 8.1).
+- **Avanza el reloj de la partida** (`updateMatch`): empieza o termina rondas (ver 8.1).
+- **Revisa si algún auto llegó al pasajero** (solo mientras la ronda está en juego). Si es así, le suma 1 punto a ese jugador, manda `pickup` a todos y ubica al pasajero en otro lugar.
 
 ---
 
 ## 8.1 La ciudad: manzanas, Uber vs Taxi y pasajero
 
-**Mapa** (`coordinator/map.js`): el mundo es una cuadrícula de calles con manzanas de 200 × 200 px (12 en el mundo de 800 × 600). Cada calle lleva línea amarilla discontinua en el centro y pasos de cebra en los cruces. Entre dos manzanas la calle mide `2·(2·PLAYER_RADIUS + 5)` = 90 px y contra el borde del mundo 45 px: el auto siempre cabe. Cada manzana tiene un **andén** de 8 px y adentro uno de estos tipos:
+**Mapa** (`coordinator/map.js`): el mundo es una cuadrícula de calles con manzanas de 200 × 200 px: **108** en el mundo de 2400 × 1800 (12 × 9), para recorrerla como una ciudad. Cada calle lleva línea amarilla discontinua en el centro y pasos de cebra en los cruces. Entre dos manzanas la calle mide `2·(2·PLAYER_RADIUS + 5)` = 90 px y contra el borde del mundo 45 px: el auto siempre cabe. Cada manzana tiene un **andén** de 8 px y adentro uno de estos tipos:
 
 | Tipo | Qué tiene |
 |---|---|
@@ -416,7 +540,17 @@ El código de arriba es la versión base. Con la ciudad, `tick()` además:
 | `edificio` | Un edificio de azotea plana con equipos de aire acondicionado y helipuerto |
 | `parque` | Césped, senderos en cruz, fuente y árboles |
 
-Las casas se ven desde arriba con **techo a dos aguas**: dos faldones de distinto tono, la cumbrera marcada y, en algunas, chimenea. Los tamaños y colores salen de un generador pseudoaleatorio **con semilla**, así que el mismo tamaño de mundo da siempre la misma ciudad, en los tres equipos y después de reiniciar. El coordinador manda el mapa en `welcome` y el cliente lo dibuja una sola vez en un canvas aparte.
+**Barrios**: el tipo de cada manzana depende de su distancia al centro de la ciudad, con un sorteo con semilla:
+
+| Zona | Distancia al centro | Más probable | Pisos de los edificios |
+|---|---|---|---|
+| Centro | hasta 30 % | edificios (68 %): forman el **skyline** | 8 a 14 |
+| Intermedia | hasta 62 % | mezcla de casas, conjuntos, edificios y parques | 4 a 8 |
+| Afueras | resto | casas y conjuntos (80 %) | 3 a 5 |
+
+Los parques aparecen en todas las zonas. En el mundo de 2400 × 1800 salen 41 manzanas de casas, 30 conjuntos, 21 edificios y 16 parques: 344 casas y 144 árboles.
+
+Las casas tienen paredes y **techo a dos aguas** y, algunas, chimenea (ver *Vista 3D* más abajo). Los tamaños y colores salen de un generador pseudoaleatorio **con semilla**, así que el mismo tamaño de mundo da siempre la misma ciudad, en los tres equipos y después de reiniciar. El coordinador manda el mapa en `welcome` y el cliente arma la escena 3D una sola vez.
 
 **Colisiones (servidor autoritativo)**: cada manzana, con su andén, es un rectángulo **sólido**. Como en una ciudad real, los autos van por la calle: no pueden subirse al andén ni meterse entre las casas.
 - El auto se trata como un círculo de radio `PLAYER_RADIUS`. Contra cada polígono se busca el punto del borde más cercano y se usa *ray casting* para saber si el centro quedó adentro.
@@ -431,9 +565,35 @@ Las casas se ven desde arriba con **techo a dos aguas**: dos faldones de distint
   - **Uber**: puede elegir color, menos **amarillo**, para no confundirse con un taxi. Se considera amarillo un tono entre 40° y 70° en HSL, saturado (≥ 50 %) y con luminosidad entre 30 % y 85 %. Cubre `#ffc928`, `#ffff00` y sus variantes, pero no naranjas ni blancos. Las muestras no incluyen el amarillo, el selector libre lo rechaza con un aviso y el coordinador lo descarta si llega igual. El botón ↺ vuelve al negro Uber.
   - El cliente aplica la misma regla al dibujar: un taxi se ve amarillo y un Uber nunca amarillo, digan lo que digan los `extras`.
 
-**Auto**: se dibuja visto desde arriba, con parabrisas, faros y luces traseras, rotado según `angle`. El ángulo se interpola por el camino más corto entre ticks. El dibujo cabe dentro del círculo de colisión.
+**Choque entre autos (servidor autoritativo)**: cada auto es un círculo de radio `PLAYER_RADIUS` y **dos autos no pueden superponerse**. Después de mover a todos, el tick revisa cada par de autos. Si se tocan, cada uno retrocede la mitad de lo que se penetraron, sobre la línea que une sus centros: un auto en movimiento **empuja** al que está quieto. Luego se los vuelve a sacar de las manzanas y a meter en el mundo, y se repite hasta 4 veces para que varios autos juntos queden separados. Al entrar, un auto aparece lejos de los demás para no caer encima de nadie.
 
-**Pasajero** 🙋: hay **uno solo, compartido**. Espera en la calle **junto al andén** de una manzana, en un punto donde cabe un auto (así siempre es alcanzable) y, si se puede, a más de 150 px de todos los autos. Se ve como un punto amarillo que late, y una flecha amarilla junto a tu auto apunta hacia él. El primer auto que llega lo recoge: el servidor lo decide en el tick y suma 1 al jugador y a su equipo. El puntaje se ve junto al nombre en el mapa y en la lista "En línea", y el marcador **UBER · TAXI** en la esquina inferior derecha del mapa.
+**Partida Uber vs Taxi (por rondas, servidor autoritativo)**: el coordinador lleva el reloj de la partida en `match`.
+- `waiting` → cuando entra el primer jugador empieza la **ronda 1** (`playing`), de `MATCH_SECONDS` (3 min). Todos arrancan en 0 y se manda `match_start`.
+- Al acabarse el tiempo, la ronda pasa a `ended`: gana el equipo con más pasajeros (`teams`), o hay empate. Se manda `match_end` con el ganador, el marcador y el **podio** (los 3 conductores con más pasajeros). Durante la pausa (`MATCH_BREAK_SECONDS`, 10 s) los autos se pueden mover pero **no se recogen pasajeros**.
+- Termina la pausa → **ronda nueva** con todos los puntajes en 0.
+- Si se van todos, el reloj se detiene (`waiting`) y la próxima conexión empieza otra ronda.
+- En cada `state` va `match: { phase, round, remainingMs }`, más `result` durante la pausa, así quien entra en ese momento también ve el cartel. Va el tiempo **restante** y no la hora, para no depender de los relojes de los equipos.
+- En pantalla: **🏁 Ronda N · 2:15** arriba al centro (en rojo los últimos 15 s) y, al terminar, un cartel con **🏆 ¡GANA TAXI!** (o UBER, o EMPATE), el marcador, el podio 🥇🥈🥉 y "Nueva ronda en 8 s".
+
+**Marcador por equipo**: `teams.uber` y `teams.taxi` son la **suma de los pasajeros de los conductores conectados**, calculada en cada tick a partir del `Map` de jugadores. Cuando un conductor cierra sesión, sus pasajeros dejan de contar para su equipo, y si vuelve a entrar arranca en 0. El puntaje es parte del estado de la sesión y no se guarda en ninguna base. Solo se conserva si la misma cuenta se abre en otra pestaña (`4002`), porque es la misma sesión que sigue.
+
+**Vista 3D** (Three.js r149, servido por el propio cliente desde `node_modules` en `/vendor/three.min.js`, así no depende de un CDN el día de la demo):
+- **Ciudad**: asfalto con líneas amarillas y pasos de cebra; manzanas con andén elevado; casas con paredes y **techo a dos aguas** (prisma), chimeneas; edificios con fachada de ventanas (más altos en el centro), equipos en la azotea y helipuerto; parques con senderos, fuente y árboles. Sol con sombras.
+- **Rendimiento con la ciudad grande**: cada pieza que se repite (andenes, paredes, techos, chimeneas, árboles, fuentes, líneas, cebras, equipos de azotea) es **una sola malla instanciada** con una copia por casa o árbol, cada una con su posición, tamaño, giro y color. Las 108 manzanas suman unas 5.800 piezas en **87 llamadas de dibujo** y se arman en ~15 ms. Las sombras cubren 1000 px alrededor de lo que mira la cámara y se mueven con ella. Los nombres de los autos a más de 1100 px de la cámara se ocultan.
+- **Radar** (abajo a la izquierda): círculo centrado en tu auto que muestra 650 px a la redonda: manzanas por tipo, el borde del mundo, los otros autos (taxi amarillo, Uber verde) y una barrida de radar. El **pasajero** aparece como un punto que late; si está fuera de alcance, una **flecha en el borde** apunta hacia él. Debajo se ve la **distancia en metros** (un auto de 38 px mide ~4,5 m). En las vistas desde arriba el norte queda arriba; en **primera persona el radar gira con el auto** (adelante = arriba, como un GPS).
+- **Autos**: carrocería del color del bando, cabina con vidrios, ruedas, faros y luces traseras. El **taxi** lleva letrero `TAXI` sobre el techo y franja de cuadros; el **Uber**, la placa con la `U`. Tu auto tiene un aro blanco en el piso.
+- **Pasajero**: una persona de pie, de unos 1,70 m a la escala de los autos, con piernas, zapatos, torso, brazos, manos, cuello, cabeza, pelo y ojos. Saluda con el brazo derecho y **se gira para mirar tu auto**. Cada pasajero nuevo se viste distinto (camiseta, pantalón, piel y pelo salen de su posición, igual en todas las pantallas). Encima tiene un marcador amarillo que flota y, en el piso, un anillo que late. Una flecha amarilla en el piso junto a tu auto apunta hacia él.
+- **Etiquetas, marcador y avisos** van en HTML encima del lienzo: nombre, mood, puntaje y badge del provider sobre cada auto; **UBER · TAXI** abajo a la derecha; el aviso de recogida arriba. Todo con `textContent`, sin `innerHTML`.
+- **Pantalla completa** (botón ⛶ dentro del juego o tecla **F**; Esc o el mismo botón la cierran): el juego ocupa toda la pantalla, con el marcador, las etiquetas y los botones de cámara y pantalla completa. El navegador solo la permite después de un clic o una tecla del usuario.
+- **Cámara** (botón 🎥 dentro del juego o tecla **C**; rota entre tres modos y se recuerda al recargar; por defecto, *Seguir mi auto*):
+  - *Vista de la ciudad*: toda la ciudad en diagonal (la niebla y el alcance de la cámara crecen con el tamaño del mundo).
+  - *Seguir mi auto*: desde arriba y detrás de tu auto.
+  - *Primera persona*: desde el asiento del conductor, con el capó a la vista, cielo, una barrera en el borde del mundo y edificios en el horizonte. Tu cabina, tu letrero y tu etiqueta se ocultan.
+- **Teclas**: en las dos vistas desde arriba son absolutas (W = norte, D = este…). En **primera persona** son relativas al auto: **W acelera, S da reversa** (retrocede sin darse vuelta, más lento), **A/D giran 45°** (al apretar y cada 220 ms mientras se mantienen) y W+S frena. El cliente traduce eso a la misma intención `{x, y}` en −1/0/1 (más `reverse` en la reversa) que valida el coordinador, así que **el servidor no se entera del modo de cámara**: sigue recibiendo solo intenciones y sigue siendo la autoridad.
+- El mundo del servidor sigue siendo **plano**: `(x, y)` se dibuja en la escena como `(x, z)` y `angle` rota el auto sobre el eje vertical. El 3D es solo presentación: el cliente no calcula posiciones ni colisiones.
+- Sin WebGL, el lienzo muestra un aviso en lugar del juego.
+
+**Pasajero** 🙋: hay **uno solo, compartido**. Espera en la calle **junto al andén** de una manzana, en un punto donde cabe un auto (así siempre es alcanzable) y, si se puede, a más de 150 px de todos los autos. Se ve como un punto amarillo que late, y una flecha amarilla junto a tu auto apunta hacia él. El primer auto que llega lo recoge: el servidor lo decide en el tick y suma 1 al jugador y a su equipo. El puntaje se ve sobre cada auto y en la lista "En línea", y el marcador **UBER · TAXI** abajo a la derecha de la vista.
 
 ---
 
@@ -493,10 +653,10 @@ Las casas se ven desde arriba con **techo a dos aguas**: dos faldones de distint
 
 ### Cliente: dibujar, no simular
 
-- `lastState` es una **variable global** con el último `state` del servidor; el canvas dibuja eso. Para que el movimiento a 20 Hz se vea fluido a 60 fps, se **interpola** entre el `state` anterior y el último (solo entre posiciones que ya mandó el servidor; no hay predicción).
+- `lastState` es una **variable global** con el último `state` del servidor; la vista 3D dibuja eso. Para que el movimiento a 20 Hz se vea fluido a 60 fps, se **interpola** entre el `state` anterior y el último (solo entre posiciones que ya mandó el servidor; no hay predicción).
 - Si alguien modifica `lastState` en DevTools, solo cambia **su** pantalla y solo hasta el próximo tick: el servidor es la fuente de verdad.
 - El intent se manda **solo cuando cambia la dirección** (keydown/keyup), no en cada frame. Al perder el foco (`blur`) se manda `{0,0}` para que el jugador no quede caminando solo.
-- El canvas toma su tamaño de `welcome.world`, no de valores fijos en el HTML.
+- La escena 3D se arma con `welcome.world` (tamaño, manzanas y casas), no con valores fijos en el HTML.
 
 ### Sesión del mismo usuario en otra pestaña
 
@@ -540,12 +700,14 @@ Igual que en la Parte I: gana la conexión nueva y la anterior se cierra con `40
 ## 12. Tests automáticos
 
 ```bash
-cd auth-service && npm test     # 28 tests: esquema, /register, /login, /auth/google, migración
-cd coordinator  && npm test     # 25 tests: geometría del mapa + coordinador real jugando por WebSocket
+cd auth-service && npm test     # 37 tests (28 + 9 del directorio): esquema, /register, /login, /auth/google, migración
+cd coordinator  && npm test     # 35 tests (30 + 5 del mesh con procesos reales): geometría del mapa + coordinador real jugando por WebSocket
 ```
 
 - **Auth**: los ID tokens de prueba (`fake:<json>`) se resuelven con un stub de `verifyIdToken` (no hace falta una cuenta de Google); cualquier otro token pasa por la verificación **real** de `google-auth-library` y debe ser rechazado (token falsificado con firma propia → `401`).
-- **Coordinador**: `welcome`, 20 Hz, velocidad con `{x: 9999}`, diagonales, spam de intents, clamp a los bordes, mensajes inválidos (`null`, arrays, strings), replicación de extras, mensaje > 4 KB, `players_update`, `4002` conservando posición, `4001` por token vencido, `SESSION_MAX_AGE` en caliente, cambio de `JWT_EXPIRES_IN` en el auth (vía `/token-policy`) que cierra una sesión abierta al cumplirse la nueva duración contada desde el cambio (no al instante), pasajero (se recoge, suma 1 y reaparece), ciudad (12 manzanas con casas, conjuntos, edificios y parques; el auto no atraviesa ninguna en 8 direcciones; el pasajero nunca cae dentro de una), `vehicle` leído del JWT (sin `vehicle` = taxi; `extras` no lo cambia), color por bando (el taxi no puede cambiarlo, el Uber no puede usar amarillo) y marcador por equipo.
+- **Coordinador**: `welcome`, 20 Hz, velocidad con `{x: 9999}`, diagonales, spam de intents, clamp a los bordes, mensajes inválidos (`null`, arrays, strings), replicación de extras, mensaje > 4 KB, `players_update`, `4002` conservando posición, `4001` por token vencido, `SESSION_MAX_AGE` en caliente, cambio de `JWT_EXPIRES_IN` en el auth (vía `/token-policy`) que cierra una sesión abierta al cumplirse la nueva duración contada desde el cambio (no al instante), pasajero (se recoge, suma 1 y reaparece), ciudad (12 manzanas con casas, conjuntos, edificios y parques; el auto no atraviesa ninguna en 8 direcciones; el pasajero nunca cae dentro de una), `vehicle` leído del JWT (sin `vehicle` = taxi; `extras` no lo cambia), color por bando (el taxi no puede cambiarlo, el Uber no puede usar amarillo), marcador por equipo (solo suma a los conectados; al cerrar sesión se descuenta y al volver arranca en 0) choque entre autos (no se superponen), reversa (no gira, 60 % de velocidad, solo con `reverse: true`) y partida por rondas (fin de ronda, ganador, podio y ronda nueva en 0).
+- **Directorio** (`auth-service/test/directory.test.js`): heartbeat que registra al coordinador, 401 sin token de coordinador y 403 si el token es de otro, validaciones 400, el menos cargado con empate al primero, reparto de 4 clientes que llegan juntos, `exclude`, 503 sin coordinadores, descarte por TTL (también de `/peers`) y `/peers` con token.
+- **Mesh** (`coordinator/test/mesh.test.js`): levanta el **auth real y tres coordinadores reales** y recorre la sustentación: los tres en `/peers` y en un mesh completo con un solo líder, 4 clientes repartidos, Alice en coord-a y Bob en coord-b que se ven moverse con **la misma posición en los dos coordinadores**, extras, pasajero y ronda replicados, la misma cuenta abierta en otro coordinador (4002 conservando la posición), y la caída de coord-b: sus clientes se desconectan, el auth deja de devolverlo, desaparece de `/peers` y el cliente se reconecta a uno vivo. Los archivos de test corren de a uno (`--test-concurrency=1`) para que el del mesh no compita por CPU y puertos con los demás.
 - **Mapa** (`test/map.test.js`): colisión círculo-polígono y círculo-círculo, salida por el lado más cercano, polígono cóncavo (L).
 
 ---
