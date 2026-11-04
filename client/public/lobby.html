@@ -31,8 +31,37 @@
         <h2>🗺️ La ciudad</h2>
         <span class="hint keys">Maneja con <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> o las flechas y recoge al pasajero 🙋 antes que los demás</span>
       </div>
-      <!-- Las dimensiones reales las fija el mensaje 'welcome' del coordinador -->
-      <canvas id="world" width="800" height="600" aria-label="Mapa del juego"></canvas>
+      <!-- Vista 3D (Three.js). El tamaño del mundo lo fija el mensaje 'welcome' -->
+      <div id="world" class="world-3d" aria-label="Mapa del juego en 3D">
+        <div id="labels" class="labels-layer" aria-hidden="true"></div>
+        <!-- Dentro del juego para que sigan disponibles en pantalla completa -->
+        <div class="stage-tools">
+          <button type="button" id="camera-mode" class="stage-btn" title="Cambiar cámara (C)">🎥 Vista de la ciudad</button>
+          <button type="button" id="fullscreen" class="stage-btn" title="Pantalla completa (F)">⛶ Pantalla completa</button>
+          <!-- A qué coordinador del mesh está conectado este cliente -->
+          <span id="coord-chip" class="stage-chip" hidden></span>
+        </div>
+        <div id="teams-hud" class="teams-hud" hidden></div>
+        <div id="toast" class="toast-3d" role="status" hidden></div>
+        <!-- Partida Uber vs Taxi: ronda y tiempo, y el cartel del ganador -->
+        <div id="match-hud" class="match-hud" hidden></div>
+        <div id="match-end" class="match-end" role="status" hidden>
+          <div class="match-card">
+            <p class="match-round" id="match-end-round"></p>
+            <h3 class="match-winner" id="match-end-winner"></h3>
+            <p class="match-score" id="match-end-score"></p>
+            <ol class="match-podium" id="match-end-podium"></ol>
+            <p class="match-next" id="match-end-next"></p>
+          </div>
+        </div>
+        <!-- Cuenta regresiva hasta que el coordinador cierre la sesión -->
+        <div id="session-timer" class="session-timer" title="Tiempo hasta que caduque tu sesión" hidden></div>
+        <!-- Radar: alrededor de mi auto, con el pasajero para guiarse -->
+        <div id="radar" class="radar" hidden>
+          <canvas id="radar-canvas" width="190" height="190" aria-label="Radar con la ubicación del pasajero"></canvas>
+          <div id="radar-info" class="radar-info"></div>
+        </div>
+      </div>
     </section>
 
     <aside class="side-panel">
@@ -58,12 +87,16 @@
     </aside>
   </main>
 
-  <!-- COORDINATOR_WS viene del .env del cliente (server.js lo sirve como /config.js) -->
+  <!-- AUTH_URL (y COORDINATOR_WS de respaldo) vienen del .env del cliente (server.js los sirve como /config.js) -->
+  <!-- Three.js lo sirve el propio cliente (client/server.js -> node_modules) -->
+  <script src="vendor/three.min.js"></script>
   <script src="config.js"></script>
   <script>
     const token = localStorage.getItem('token');
     const username = localStorage.getItem('username') || '';
-    const { COORDINATOR_WS } = window.APP_CONFIG;
+    // AUTH_URL: el auth también es el directorio de coordinadores (Taller 6).
+    // COORDINATOR_WS solo se usa si el auth no tiene directorio (Taller 5).
+    const { AUTH_URL, COORDINATOR_WS } = window.APP_CONFIG;
 
     // Último 'state' recibido del servidor. Es lo único que se dibuja.
     // Modificarlo desde DevTools solo cambia ESTA pantalla: el servidor es la
@@ -177,328 +210,939 @@
       }
     }
 
-    // ---------- Canvas ----------
-    const canvas = document.getElementById('world');
-    const ctx = canvas.getContext('2d');
+    // ---------- Vista 3D (Three.js) ----------
+    // El mundo del servidor es plano (x, y en px). En 3D: x -> x, y -> z y la
+    // altura es el eje y. Igual que en 2D, el cliente solo DIBUJA lastState:
+    // no calcula posiciones ni colisiones.
+    const stage = document.getElementById('world');
+    const labelsLayer = document.getElementById('labels');
+    const teamsHud = document.getElementById('teams-hud');
+    const toastEl = document.getElementById('toast');
+    const cameraBtn = document.getElementById('camera-mode');
 
-    // La ciudad no cambia durante la partida: se dibuja una vez (al recibir
-    // 'welcome') en un canvas aparte y en cada frame solo se copia.
-    let cityLayer = null;
-    // Tejas: [faldón iluminado, faldón en sombra]
-    const ROOFS = [['#c0583f', '#93402d'], ['#a8473a', '#7d3229'], ['#8a6a52', '#665040'], ['#5d6b80', '#45505f'], ['#b07a45', '#865a31']];
+    let renderer = null, scene = null, camera = null, cityGroup = null, sun = null;
+    const cars = new Map(); // userId -> { group, bodyMat, color, label, ring }
+    let passengerObj = null, guideArrow = null;
+    let viewSize = { w: 800, h: 600 };
+    const camTarget = newVector();
+    // Por defecto la cámara sigue a mi auto (la ciudad es grande)
+    let cameraMode = 'seguir';
+    try {
+      const saved = localStorage.getItem('camera-mode');
+      if (saved === 'ciudad' || saved === 'seguir' || saved === 'primera') cameraMode = saved;
+    } catch (_) {}
 
-    // Casa vista desde arriba: techo a dos aguas partido por la cumbrera
-    function drawHouse(c, h) {
-      const [lit, dark] = ROOFS[h.roof % ROOFS.length];
-      c.fillStyle = 'rgba(0, 0, 0, .35)';
-      c.fillRect(h.x + 3, h.y + 3, h.w, h.h);
-      if (h.ridge === 'h') {
-        c.fillStyle = lit; c.fillRect(h.x, h.y, h.w, h.h / 2);
-        c.fillStyle = dark; c.fillRect(h.x, h.y + h.h / 2, h.w, h.h / 2);
-      } else {
-        c.fillStyle = lit; c.fillRect(h.x, h.y, h.w / 2, h.h);
-        c.fillStyle = dark; c.fillRect(h.x + h.w / 2, h.y, h.w / 2, h.h);
-      }
-      // Cumbrera y borde del techo
-      c.strokeStyle = 'rgba(255, 235, 210, .35)';
-      c.lineWidth = 1.5;
-      c.beginPath();
-      if (h.ridge === 'h') { c.moveTo(h.x + 2, h.y + h.h / 2); c.lineTo(h.x + h.w - 2, h.y + h.h / 2); }
-      else { c.moveTo(h.x + h.w / 2, h.y + 2); c.lineTo(h.x + h.w / 2, h.y + h.h - 2); }
-      c.stroke();
-      c.strokeStyle = 'rgba(0, 0, 0, .55)';
-      c.lineWidth = 1;
-      c.strokeRect(h.x + 0.5, h.y + 0.5, h.w - 1, h.h - 1);
-      if (h.chimney) {
-        c.fillStyle = '#5b4a42';
-        c.fillRect(h.x + h.w * 0.7, h.y + h.h * 0.18, 5, 5);
-      }
+    // Si Three.js no cargó, THREE no existe: esto evita un error al declarar
+    // las variables y la pantalla muestra un aviso (ver init3D).
+    function newVector() { return window.THREE ? new THREE.Vector3() : { x: 0, y: 0, z: 0 }; }
+
+    const ROOFS = ['#b5523b', '#9c4434', '#7d5e48', '#55657c', '#a36f3f'];
+    const WALLS = ['#e9dcc3', '#d9c6a5', '#f1e7d6', '#cfd6dc', '#e4cfc0'];
+
+    // Coordenadas del servidor -> escena (el centro del mundo queda en el origen)
+    function toScene(x, y, h = 0) {
+      return new THREE.Vector3(x - world.width / 2, h, y - world.height / 2);
     }
 
-    function drawBuilding(c, b) {
-      c.fillStyle = 'rgba(0, 0, 0, .4)';
-      c.fillRect(b.x + 4, b.y + 4, b.w, b.h);
-      c.fillStyle = '#4a5266';
-      c.fillRect(b.x, b.y, b.w, b.h);
-      c.strokeStyle = '#2b3140';
-      c.lineWidth = 3;
-      c.strokeRect(b.x + 1.5, b.y + 1.5, b.w - 3, b.h - 3);
-      // Azotea: equipos de aire acondicionado y helipuerto
-      c.fillStyle = '#6b7488';
-      for (let k = 0; k < b.units; k++) c.fillRect(b.x + 8 + k * 14, b.y + 8, 10, 8);
-      const cx = b.x + b.w * 0.62, cy = b.y + b.h * 0.62, r = Math.min(b.w, b.h) * 0.2;
-      c.strokeStyle = '#ffc928';
-      c.lineWidth = 2;
-      c.beginPath(); c.arc(cx, cy, r, 0, Math.PI * 2); c.stroke();
-      c.fillStyle = '#ffc928';
-      c.font = `bold ${Math.round(r)}px "Russo One", sans-serif`;
-      c.textAlign = 'center';
-      c.textBaseline = 'middle';
-      c.fillText('H', cx, cy + 1);
+    function lambert(color, extra = {}) {
+      return new THREE.MeshLambertMaterial({ color, ...extra });
     }
 
-    function drawPark(c, b) {
+    // Textura dibujada con canvas 2D (letreros, ventanas, helipuerto, cuadros)
+    function canvasTexture(w, h, draw) {
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      draw(c.getContext('2d'), w, h);
+      const tex = new THREE.CanvasTexture(c);
+      tex.anisotropy = 4;
+      return tex;
+    }
+
+    function shadowed(mesh, cast = true, receive = true) {
+      mesh.castShadow = cast;
+      mesh.receiveShadow = receive;
+      return mesh;
+    }
+
+    function init3D() {
+      if (renderer) return true;
+      if (!window.THREE) {
+        stage.classList.add('no-3d');
+        stage.dataset.msg = 'No se pudo cargar la vista 3D (Three.js).';
+        return false;
+      }
+      try {
+        renderer = new THREE.WebGLRenderer({ antialias: true });
+      } catch (err) {
+        stage.classList.add('no-3d');
+        stage.dataset.msg = 'Tu navegador no tiene WebGL activo: no se puede mostrar la vista 3D.';
+        return false;
+      }
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      stage.prepend(renderer.domElement);
+
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color('#10131a');
+      scene.fog = new THREE.Fog('#10131a', 1400, 2600);
+
+      scene.add(new THREE.HemisphereLight('#e3ecff', '#2a2d35', 0.75));
+      // Sol con sombras. Las sombras cubren un cuadrado de 1000 px alrededor de
+      // donde mira la cámara (ver updateSun): en una ciudad grande no alcanza
+      // una sola sombra para todo el mapa.
+      sun = new THREE.DirectionalLight('#ffffff', 0.85);
+      sun.castShadow = true;
+      sun.shadow.mapSize.set(2048, 2048);
+      Object.assign(sun.shadow.camera, { left: -500, right: 500, top: 500, bottom: -500, near: 10, far: 2000 });
+      scene.add(sun, sun.target);
+
+      camera = new THREE.PerspectiveCamera(45, 4 / 3, 1, 5000);
+      new ResizeObserver(resize3D).observe(stage);
+      return true;
+    }
+
+    // Normal: el lienzo ocupa el ancho de la tarjeta con la proporción del
+    // mundo. Pantalla completa: ocupa toda la pantalla.
+    function resize3D() {
+      if (!renderer || !world) return;
+      const full = document.fullscreenElement === stage;
+      const w = full ? window.innerWidth : stage.clientWidth;
+      const h = full ? window.innerHeight : Math.round(w * (world.height / world.width));
+      viewSize = { w, h };
+      renderer.setSize(w, h);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // ----- Ciudad (se arma una vez, al recibir 'welcome') -----
+    // La ciudad tiene cientos de casas y árboles. Cada pieza que se repite se
+    // dibuja INSTANCIADA: una sola malla con muchas copias (posición, tamaño,
+    // giro y color por copia). La tarjeta de video hace pocas llamadas por
+    // cuadro y la página no se pone lenta aunque el mapa sea grande.
+    function batch(geometry, material, { cast = true, receive = true } = {}) {
+      return { geometry, material, cast, receive, items: [] };
+    }
+    // pos en la escena; size = escala [x, y, z]; color opcional por copia
+    function put(b, pos, size = [1, 1, 1], rotY = 0, color = null) {
+      b.items.push({ pos, size, rotY, color });
+    }
+    function flush(b) {
+      if (!b.items.length) return;
+      const mesh = new THREE.InstancedMesh(b.geometry, b.material, b.items.length);
+      const tmp = new THREE.Object3D();
+      const col = new THREE.Color();
+      b.items.forEach((it, i) => {
+        tmp.position.copy(it.pos);
+        tmp.rotation.set(0, it.rotY, 0);
+        tmp.scale.set(it.size[0], it.size[1], it.size[2]);
+        tmp.updateMatrix();
+        mesh.setMatrixAt(i, tmp.matrix);
+        if (it.color) mesh.setColorAt(i, col.set(it.color));
+      });
+      mesh.castShadow = b.cast;
+      mesh.receiveShadow = b.receive;
+      cityGroup.add(mesh);
+    }
+
+    // Prisma triangular: techo a dos aguas de 1 x 1 x 1 (ancho, alto, largo),
+    // con la cumbrera sobre el eje z. Cada casa lo escala a su medida.
+    function unitGableRoof() {
+      const shape = new THREE.Shape();
+      shape.moveTo(-0.5, 0);
+      shape.lineTo(0.5, 0);
+      shape.lineTo(0, 1);
+      shape.closePath();
+      const geo = new THREE.ExtrudeGeometry(shape, { depth: 1, bevelEnabled: false });
+      geo.translate(0, 0, -0.5);
+      return geo;
+    }
+
+    let windowTex = null;
+    function buildCity3D() {
+      if (cityGroup) scene.remove(cityGroup);
+      cityGroup = new THREE.Group();
+      const W = world.width, H = world.height;
+      const unitBox = new THREE.BoxGeometry(1, 1, 1);
+      unitBox.translate(0, 0.5, 0); // apoyada en el piso: pos.y es la base
+      const white = lambert('#ffffff'); // el color va por copia
+
+      // Asfalto del mundo y césped alrededor (hasta el horizonte)
+      const grass = new THREE.Mesh(new THREE.PlaneGeometry(W + 6000, H + 6000), lambert('#355e3b'));
+      grass.rotation.x = -Math.PI / 2;
+      grass.position.y = -0.1;
+      cityGroup.add(grass);
+      const ground = shadowed(new THREE.Mesh(new THREE.PlaneGeometry(W + 24, H + 24), lambert('#2b2e36')), false, true);
+      ground.rotation.x = -Math.PI / 2;
+      cityGroup.add(ground);
+      addWorldEdge(W, H, unitBox);
+      const m = world.blocks.length ? world.blocks[0].x : 0; // media calle
+      addRoadMarks(W, H, m);
+
+      const B = {
+        curb: batch(unitBox, lambert('#a3a5ac'), { cast: false }),
+        lot: batch(unitBox, white, { cast: false }),
+        wall: batch(unitBox, white),
+        roof: batch(unitGableRoof(), white),
+        chimney: batch(unitBox, lambert('#6b4d42')),
+        path: batch(unitBox, lambert('#c9b68c'), { cast: false }),
+        basin: batch(new THREE.CylinderGeometry(13, 14, 3, 24), lambert('#bfb39a')),
+        water: batch(new THREE.CylinderGeometry(10.5, 10.5, 0.4, 24), lambert('#4aa3d8', { emissive: '#12324a' }), { cast: false }),
+        jet: batch(new THREE.CylinderGeometry(1, 1.5, 7, 8), lambert('#9fd6f5', { transparent: true, opacity: 0.8 }), { cast: false }),
+        trunk: batch(new THREE.CylinderGeometry(1.4, 1.9, 9, 6), lambert('#6b4a32')),
+        crown: batch(new THREE.IcosahedronGeometry(1, 0), lambert('#2f8a4a', { flatShading: true })),
+        ac: batch(new THREE.BoxGeometry(9, 5, 7), lambert('#8b93a5')),
+        pad: batch(new THREE.CircleGeometry(1, 28).rotateX(-Math.PI / 2), new THREE.MeshLambertMaterial({ map: helipadTexture() }), { cast: false }),
+      };
       const s = world.sidewalk;
-      const x = b.x + s, y = b.y + s, w = b.size - 2 * s;
-      // Senderos en cruz y fuente
-      c.fillStyle = '#c8b48a';
-      c.fillRect(x + w / 2 - 4, y, 8, w);
-      c.fillRect(x, y + w / 2 - 4, w, 8);
-      c.fillStyle = '#c8b48a';
-      c.beginPath(); c.arc(x + w / 2, y + w / 2, 14, 0, Math.PI * 2); c.fill();
-      c.fillStyle = '#4aa3d8';
-      c.beginPath(); c.arc(x + w / 2, y + w / 2, 9, 0, Math.PI * 2); c.fill();
-      for (const t of b.trees) {
-        c.fillStyle = 'rgba(0, 0, 0, .3)';
-        c.beginPath(); c.arc(t.x + 2, t.y + 2, t.r, 0, Math.PI * 2); c.fill();
-        c.fillStyle = '#2f7d45';
-        c.beginPath(); c.arc(t.x, t.y, t.r, 0, Math.PI * 2); c.fill();
-        c.fillStyle = '#3f9c58';
-        c.beginPath(); c.arc(t.x - t.r * 0.3, t.y - t.r * 0.3, t.r * 0.5, 0, Math.PI * 2); c.fill();
-      }
-    }
-
-    function buildCityLayer() {
-      cityLayer = document.createElement('canvas');
-      cityLayer.width = world.width;
-      cityLayer.height = world.height;
-      const c = cityLayer.getContext('2d');
-      // Asfalto: todo lo que no es manzana es calle
-      c.fillStyle = '#2a2d35';
-      c.fillRect(0, 0, world.width, world.height);
-
-      const cell = world.cell;
-      const m = world.blocks.length ? world.blocks[0].x : 0; // ancho de la franja de calle por lado
-      // Línea amarilla discontinua en el centro de cada calle
-      c.strokeStyle = 'rgba(255, 201, 40, .7)';
-      c.lineWidth = 2;
-      c.setLineDash([12, 10]);
-      c.beginPath();
-      for (let x = cell; x < world.width; x += cell) { c.moveTo(x, 0); c.lineTo(x, world.height); }
-      for (let y = cell; y < world.height; y += cell) { c.moveTo(0, y); c.lineTo(world.width, y); }
-      c.stroke();
-      c.setLineDash([]);
-
-      if (m) {
-        // Cruces: el centro va sin línea y cada entrada lleva paso de cebra
-        for (let ix = cell; ix < world.width; ix += cell) {
-          for (let iy = cell; iy < world.height; iy += cell) {
-            c.fillStyle = '#2a2d35';
-            c.fillRect(ix - m, iy - m, 2 * m, 2 * m);
-            c.fillStyle = 'rgba(240, 240, 240, .75)';
-            for (let k = -m + 4; k < m - 4; k += 9) {
-              c.fillRect(ix + k, iy - m - 12, 5, 9);   // norte
-              c.fillRect(ix + k, iy + m + 3, 5, 9);    // sur
-              c.fillRect(ix - m - 12, iy + k, 9, 5);   // oeste
-              c.fillRect(ix + m + 3, iy + k, 9, 5);    // este
-            }
-          }
-        }
-      }
-
       for (const b of world.blocks) {
-        // Andén (gris claro con bordillo) y lote interior
-        c.fillStyle = '#9a9ca3';
-        c.beginPath(); c.roundRect(b.x, b.y, b.size, b.size, 8); c.fill();
-        c.strokeStyle = '#6d7078';
-        c.lineWidth = 2;
-        c.stroke();
-        const s = world.sidewalk;
-        c.fillStyle = b.type === 'edificio' ? '#7c7f87' : '#3e6b3f';
-        c.fillRect(b.x + s, b.y + s, b.size - 2 * s, b.size - 2 * s);
-        if (b.houses) for (const h of b.houses) drawHouse(c, h);
-        if (b.building) drawBuilding(c, b.building);
-        if (b.trees) drawPark(c, b);
+        const c = toScene(b.x + b.size / 2, b.y + b.size / 2);
+        // Andén elevado y lote interior (césped o concreto)
+        put(B.curb, new THREE.Vector3(c.x, 0, c.z), [b.size, 2, b.size]);
+        put(B.lot, new THREE.Vector3(c.x, 2, c.z), [b.size - 2 * s, 0.1, b.size - 2 * s], 0, b.type === 'edificio' ? '#7d8089' : '#3f7a43');
+        (b.houses || []).forEach((h, i) => addHouse(B, h, i));
+        if (b.building) addBuilding(B, b.building);
+        if (b.trees) addPark(B, b);
       }
+      Object.values(B).forEach(flush);
+      scene.add(cityGroup);
     }
 
-    function drawBackground() {
-      if (!cityLayer) buildCityLayer();
-      ctx.drawImage(cityLayer, 0, 0);
+    function addHouse(B, h, i) {
+      const wallH = 10 + (h.roof % 3) * 2;
+      const c = toScene(h.x + h.w / 2, h.y + h.h / 2);
+      put(B.wall, new THREE.Vector3(c.x, 2, c.z), [h.w, wallH, h.h], 0, WALLS[(h.roof + i) % WALLS.length]);
+      // Cumbrera 'h' = paralela al eje x del mundo; 'v' = paralela al eje y (z en 3D)
+      const span = (h.ridge === 'h' ? h.h : h.w) + 2;
+      const len = (h.ridge === 'h' ? h.w : h.h) + 2;
+      put(B.roof, new THREE.Vector3(c.x, 2 + wallH, c.z), [span, Math.min(span, len) * 0.38, len],
+        h.ridge === 'h' ? Math.PI / 2 : 0, ROOFS[h.roof % ROOFS.length]);
+      if (h.chimney) put(B.chimney, new THREE.Vector3(c.x + h.w * 0.22, 2 + wallH + 1.5, c.z - h.h * 0.15), [4, 9, 4]);
     }
 
-    // Auto visto desde arriba. El servidor lo trata como un círculo de radio r
-    // (colisiones); el dibujo cabe dentro de ese círculo. angle = 0 mira a la derecha.
-    // vehicle decide el letrero del techo: "TAXI" iluminado o la "U" de Uber.
-    function drawCar(x, y, angle, color, vehicle) {
-      const r = world.playerRadius;
-      const L = r * 1.9, W = r * 1.05;
-      ctx.save();
-      ctx.translate(x, y);
-      ctx.rotate(angle);
-      // Sombra
-      ctx.fillStyle = 'rgba(0, 0, 0, .4)';
-      ctx.beginPath(); ctx.roundRect(-L / 2 + 3, -W / 2 + 3, L, W, 6); ctx.fill();
-      // Ruedas
-      ctx.fillStyle = '#0a0a0a';
-      for (const wx of [-L * 0.28, L * 0.28]) {
-        for (const wy of [-W / 2 - 1.5, W / 2 - 2.5]) ctx.fillRect(wx - 4.5, wy, 9, 4);
-      }
-      // Carrocería
-      ctx.fillStyle = color;
-      ctx.beginPath(); ctx.roundRect(-L / 2, -W / 2, L, W, 6); ctx.fill();
-      ctx.lineWidth = 2; ctx.strokeStyle = '#0a0a0a'; ctx.stroke();
-      // Parabrisas (adelante) y luneta (atrás)
-      ctx.fillStyle = 'rgba(15, 22, 34, .85)';
-      ctx.beginPath(); ctx.roundRect(L * 0.06, -W / 2 + 3, L * 0.18, W - 6, 3); ctx.fill();
-      ctx.beginPath(); ctx.roundRect(-L * 0.34, -W / 2 + 3, L * 0.12, W - 6, 3); ctx.fill();
-      // Techo
-      ctx.fillStyle = 'rgba(255, 255, 255, .18)';
-      ctx.fillRect(-L * 0.2, -W / 2 + 4, L * 0.24, W - 8);
-      if (vehicle === 'taxi') {
-        // Franja de cuadros a los lados y letrero TAXI sobre el techo
-        for (let k = 0; k < 6; k++) {
-          ctx.fillStyle = k % 2 ? '#f4f5f7' : '#0a0a0a';
-          ctx.fillRect(-L * 0.3 + k * 4, -W / 2, 4, 2);
-          ctx.fillRect(-L * 0.3 + k * 4, W / 2 - 2, 4, 2);
-        }
-        ctx.fillStyle = '#0a0a0a';
-        ctx.fillRect(-L * 0.14, -W * 0.3, 8, W * 0.6);
-        ctx.save();
-        ctx.rotate(Math.PI / 2);
-        ctx.fillStyle = '#ffc928';
-        ctx.font = 'bold 5px Arial, sans-serif';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText('TAXI', 0, L * 0.14 - 4);
-        ctx.restore();
-      } else {
-        // Letrero de Uber: placa negra con la U
-        ctx.fillStyle = '#0a0a0a';
-        ctx.beginPath(); ctx.roundRect(-L * 0.15, -5, 10, 10, 2); ctx.fill();
-        ctx.strokeStyle = '#f4f5f7'; ctx.lineWidth = 1; ctx.stroke();
-        ctx.save();
-        ctx.translate(-L * 0.15 + 5, 0);
-        ctx.rotate(Math.PI / 2);
-        ctx.fillStyle = '#f4f5f7';
-        ctx.font = 'bold 8px Arial, sans-serif';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText('U', 0, 0.5);
-        ctx.restore();
-      }
-      // Faros y luces traseras
-      ctx.fillStyle = '#fff6b0';
-      ctx.fillRect(L / 2 - 3, -W * 0.38, 3, 4); ctx.fillRect(L / 2 - 3, W * 0.38 - 4, 3, 4);
-      ctx.fillStyle = '#ff3b3b';
-      ctx.fillRect(-L / 2, -W * 0.38, 2.5, 4); ctx.fillRect(-L / 2, W * 0.38 - 4, 2.5, 4);
-      ctx.restore();
-    }
-
-    function drawPlayer(p, x, y, angle) {
-      const r = world.playerRadius;
-      const isMe = String(p.userId) === myUserId;
-      const extras = p.extras || {};
-      const color = carColor(p);
-
-      if (isMe) {
-        ctx.beginPath();
-        ctx.arc(x, y, r + 6, 0, Math.PI * 2);
-        ctx.strokeStyle = 'rgba(255, 255, 255, .85)';
-        ctx.lineWidth = 2;
-        ctx.stroke();
-      }
-      drawCar(x, y, angle, color, p.vehicle);
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-
-      // Badge del provider (viene del JWT validado por el servidor, no de extras)
-      const bx = x + r * 0.75, by = y - r * 0.75;
-      ctx.beginPath();
-      ctx.arc(bx, by, 8, 0, Math.PI * 2);
-      ctx.fillStyle = p.provider === 'google' ? '#ffffff' : '#2a2d36';
-      ctx.fill();
-      ctx.font = 'bold 10px Inter, sans-serif';
-      ctx.fillStyle = p.provider === 'google' ? '#4285f4' : '#ffc928';
-      ctx.fillText(p.provider === 'google' ? 'G' : '🔑', bx, by + 1);
-
-      // Nombre + mood. fillText dibuja texto plano: no hay riesgo de XSS.
-      const mood = safeMood(extras.mood);
-      const label = `${p.username}${mood ? ` ${mood}` : ''} · ${p.score || 0}`;
-      ctx.font = '600 13px Inter, sans-serif';
-      ctx.textBaseline = 'bottom';
-      ctx.lineWidth = 4;
-      ctx.strokeStyle = 'rgba(0, 0, 0, .75)';
-      ctx.strokeText(label, x, y - r - 6);
-      ctx.fillStyle = isMe ? '#ffc928' : '#f4f5f7';
-      ctx.fillText(label, x, y - r - 6);
-    }
-
-    // Pasajero: punto de referencia al que hay que llegar. Su posición la
-    // decide el servidor y llega en cada 'state'.
-    function drawPassenger({ x, y }) {
-      const pr = world.passengerRadius;
-      const pulse = (performance.now() / 900) % 1;
-      ctx.beginPath();
-      ctx.arc(x, y, pr + 6 + pulse * 18, 0, Math.PI * 2);
-      ctx.strokeStyle = `rgba(255, 201, 40, ${0.8 * (1 - pulse)})`;
-      ctx.lineWidth = 3;
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.arc(x, y, pr + 4, 0, Math.PI * 2);
-      ctx.fillStyle = 'rgba(255, 201, 40, .25)';
-      ctx.fill();
-      ctx.lineWidth = 2;
-      ctx.strokeStyle = '#ffc928';
-      ctx.stroke();
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.font = `${pr * 2}px sans-serif`;
-      ctx.fillText('🙋', x, y + 1);
-    }
-
-    // Flecha junto a MI auto que apunta al pasajero (para encontrarlo rápido)
-    function drawGuide(x, y, target) {
-      const dist = Math.hypot(target.x - x, target.y - y);
-      if (dist < world.playerRadius * 4) return;
-      const a = Math.atan2(target.y - y, target.x - x);
-      const d = world.playerRadius + 18;
-      ctx.save();
-      ctx.translate(x + Math.cos(a) * d, y + Math.sin(a) * d);
-      ctx.rotate(a);
-      ctx.beginPath();
-      ctx.moveTo(9, 0); ctx.lineTo(-6, -7); ctx.lineTo(-2, 0); ctx.lineTo(-6, 7);
-      ctx.closePath();
-      ctx.fillStyle = '#ffc928';
-      ctx.fill();
-      ctx.lineWidth = 1.5;
-      ctx.strokeStyle = '#0a0a0a';
-      ctx.stroke();
-      ctx.restore();
-    }
-
-    // Marcador por equipo (lo lleva el servidor en 'state'.teams)
-    function drawTeams(teams) {
-      ctx.textBaseline = 'middle';
-      ctx.font = '15px "Russo One", sans-serif';
-      const parts = [['UBER', teams.uber, '#2ee6a6'], ['TAXI', teams.taxi, '#ffc928']];
-      const text = (label, n) => `${label} ${n}`;
-      const w = parts.reduce((s, [l, n]) => s + ctx.measureText(text(l, n)).width, 0) + 52;
-      const x = canvas.width - w - 10, y = canvas.height - 22;
-      ctx.fillStyle = 'rgba(8, 9, 12, .82)';
-      ctx.beginPath(); ctx.roundRect(x, y - 15, w, 30, 15); ctx.fill();
-      let cx = x + 14;
-      ctx.textAlign = 'left';
-      parts.forEach(([label, n, color], i) => {
-        if (i) { ctx.fillStyle = '#9aa1b2'; ctx.fillText('·', cx, y + 1); cx += 14; }
-        ctx.fillStyle = color;
-        ctx.fillText(text(label, n), cx, y + 1);
-        cx += ctx.measureText(text(label, n)).width + 10;
+    function helipadTexture() {
+      return canvasTexture(128, 128, (g, w, h) => {
+        g.fillStyle = '#2f3542'; g.fillRect(0, 0, w, h);
+        g.strokeStyle = '#ffc928'; g.lineWidth = 8;
+        g.beginPath(); g.arc(w / 2, h / 2, w / 2 - 8, 0, Math.PI * 2); g.stroke();
+        g.fillStyle = '#ffc928'; g.font = 'bold 64px Arial'; g.textAlign = 'center'; g.textBaseline = 'middle';
+        g.fillText('H', w / 2, h / 2 + 3);
       });
     }
 
-    function drawToast() {
-      if (!toast || performance.now() > toast.until) return;
-      ctx.font = '700 16px Inter, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      const w = ctx.measureText(toast.text).width + 28;
-      const x = canvas.width / 2, y = 26;
-      ctx.fillStyle = 'rgba(8, 9, 12, .85)';
-      ctx.beginPath(); ctx.roundRect(x - w / 2, y - 16, w, 32, 16); ctx.fill();
-      ctx.lineWidth = 1.5; ctx.strokeStyle = toast.mine ? '#ffc928' : 'rgba(255, 255, 255, .25)'; ctx.stroke();
-      ctx.fillStyle = toast.mine ? '#ffc928' : '#f4f5f7';
-      ctx.fillText(toast.text, x, y + 1);
+    // Los edificios son pocos y cada uno tiene su altura y su grilla de
+    // ventanas: van como mallas sueltas
+    function addBuilding(B, b) {
+      if (!windowTex) {
+        // Fachada: grilla de ventanas, algunas encendidas
+        windowTex = canvasTexture(64, 128, (g, w, h) => {
+          g.fillStyle = '#4a5266'; g.fillRect(0, 0, w, h);
+          for (let y = 6; y < h; y += 14) {
+            for (let x = 5; x < w; x += 15) {
+              g.fillStyle = Math.random() < 0.35 ? '#ffe7a3' : '#26303f';
+              g.fillRect(x, y, 9, 8);
+            }
+          }
+        });
+        windowTex.wrapS = windowTex.wrapT = THREE.RepeatWrapping;
+      }
+      // Altura por pisos (centro de la ciudad: torres altas)
+      const height = b.floors ? 10 + b.floors * 9 : 45 + b.units * 12;
+      const tex = windowTex.clone();
+      tex.needsUpdate = true;
+      tex.repeat.set(Math.max(1, Math.round(b.w / 30)), Math.max(1, Math.round(height / 40)));
+      const side = new THREE.MeshLambertMaterial({ map: tex });
+      const top = lambert('#3b4252');
+      const c = toScene(b.x + b.w / 2, b.y + b.h / 2);
+      const tower = shadowed(new THREE.Mesh(new THREE.BoxGeometry(b.w, height, b.h), [side, side, top, top, side, side]));
+      tower.position.set(c.x, 2 + height / 2, c.z);
+      cityGroup.add(tower);
+      // Azotea: equipos de aire acondicionado y helipuerto
+      for (let k = 0; k < b.units; k++) {
+        put(B.ac, new THREE.Vector3(c.x - b.w / 2 + 10 + k * 13, 2 + height + 2.5, c.z - b.h / 2 + 9));
+      }
+      const r = Math.min(b.w, b.h) * 0.22;
+      put(B.pad, new THREE.Vector3(c.x + b.w * 0.12, 2 + height + 0.2, c.z + b.h * 0.12), [r, 1, r]);
+    }
+
+    function addPark(B, b) {
+      const s = world.sidewalk;
+      const lot = b.size - 2 * s;
+      const c = toScene(b.x + b.size / 2, b.y + b.size / 2);
+      // Senderos en cruz y fuente
+      put(B.path, new THREE.Vector3(c.x, 2, c.z), [8, 0.4, lot]);
+      put(B.path, new THREE.Vector3(c.x, 2, c.z), [lot, 0.4, 8]);
+      put(B.basin, new THREE.Vector3(c.x, 3.5, c.z));
+      put(B.water, new THREE.Vector3(c.x, 5.1, c.z));
+      put(B.jet, new THREE.Vector3(c.x, 8.5, c.z));
+      // Árboles: tronco + copa
+      for (const t of b.trees) {
+        const p = toScene(t.x, t.y);
+        put(B.trunk, new THREE.Vector3(p.x, 2 + 4.5, p.z));
+        const r = t.r * 1.15;
+        put(B.crown, new THREE.Vector3(p.x, 2 + 9 + t.r * 0.8, p.z), [r, r, r]);
+      }
+    }
+
+    // Límite del mundo: barrera de concreto con franjas (el servidor no deja
+    // pasar de ahí) y, más allá, edificios lejanos para el horizonte
+    function addWorldEdge(W, H, unitBox) {
+      const stripe = canvasTexture(64, 16, (g, w, h) => {
+        for (let k = 0; k < 8; k++) {
+          g.fillStyle = k % 2 ? '#d9d9d9' : '#d23a2a';
+          g.fillRect(k * 8, 0, 8, h);
+        }
+      });
+      stripe.wrapS = THREE.RepeatWrapping;
+      for (const [len, x, y, rot] of [[W + 12, W / 2, -6, 0], [W + 12, W / 2, H + 6, 0], [H + 12, -6, H / 2, Math.PI / 2], [H + 12, W + 6, H / 2, Math.PI / 2]]) {
+        const tex = stripe.clone();
+        tex.needsUpdate = true;
+        tex.repeat.set(len / 40, 1);
+        const wall = shadowed(new THREE.Mesh(new THREE.BoxGeometry(len, 6, 4), new THREE.MeshLambertMaterial({ map: tex })));
+        wall.position.copy(toScene(x, y, 3));
+        wall.rotation.y = rot;
+        cityGroup.add(wall);
+      }
+      // Skyline: torres sencillas alrededor, a distancia
+      const rand = (() => { let sd = 7; return () => ((sd = (sd * 16807) % 2147483647) / 2147483647); })();
+      const towers = batch(unitBox, lambert('#566078'), { cast: false, receive: false });
+      const n = 60;
+      for (let k = 0; k < n; k++) {
+        const a = (k / n) * Math.PI * 2;
+        // Elipse que rodea el mundo con margen
+        const rx = W / 2 + 250 + rand() * 350, rz = H / 2 + 250 + rand() * 350;
+        const w = 50 + rand() * 70, h = 80 + rand() * 220, d = 50 + rand() * 70;
+        put(towers, new THREE.Vector3(Math.cos(a) * rx, 0, Math.sin(a) * rz), [w, h, d], rand() * Math.PI);
+      }
+      flush(towers);
+    }
+
+    // Línea amarilla discontinua en el centro de cada calle y pasos de cebra
+    function addRoadMarks(W, H, m) {
+      const cell = world.cell;
+      const dashes = [];
+      const nearCross = (v, step, limit) => {
+        for (let c = step; c < limit; c += step) if (Math.abs(v - c) < m + 2) return true;
+        return false;
+      };
+      for (let x = cell; x < W; x += cell) {
+        for (let y = 6; y < H; y += 22) if (!nearCross(y + 6, cell, H)) dashes.push([x, y + 6, 0]);
+      }
+      for (let y = cell; y < H; y += cell) {
+        for (let x = 6; x < W; x += 22) if (!nearCross(x + 6, cell, W)) dashes.push([x + 6, y, Math.PI / 2]);
+      }
+      const dash = batch(new THREE.BoxGeometry(2, 0.3, 12), lambert('#e9b923'), { cast: false });
+      for (const [x, y, rot] of dashes) put(dash, toScene(x, y, 0.15), [1, 1, 1], rot);
+      flush(dash);
+
+      if (!m) return;
+      const zebra = batch(new THREE.BoxGeometry(5, 0.3, 10), lambert('#e8e8e8'), { cast: false });
+      for (let ix = cell; ix < W; ix += cell) {
+        for (let iy = cell; iy < H; iy += cell) {
+          for (let k = -m + 6; k < m - 4; k += 9) {
+            put(zebra, toScene(ix + k, iy - m - 8, 0.15));                       // norte
+            put(zebra, toScene(ix + k, iy + m + 8, 0.15));                       // sur
+            put(zebra, toScene(ix - m - 8, iy + k, 0.15), [1, 1, 1], Math.PI / 2); // oeste
+            put(zebra, toScene(ix + m + 8, iy + k, 0.15), [1, 1, 1], Math.PI / 2); // este
+          }
+        }
+      }
+      flush(zebra);
+    }
+
+    // ----- Autos -----
+    let taxiSignTex = null, uberSignTex = null, checkerTex = null;
+    function signTextures() {
+      if (taxiSignTex) return;
+      taxiSignTex = canvasTexture(128, 48, (g, w, h) => {
+        g.fillStyle = '#0a0a0a'; g.fillRect(0, 0, w, h);
+        g.fillStyle = '#ffc928'; g.font = 'bold 34px Arial'; g.textAlign = 'center'; g.textBaseline = 'middle';
+        g.fillText('TAXI', w / 2, h / 2 + 2);
+      });
+      uberSignTex = canvasTexture(64, 64, (g, w, h) => {
+        g.fillStyle = '#0a0a0a'; g.fillRect(0, 0, w, h);
+        g.fillStyle = '#f4f5f7'; g.font = 'bold 46px Arial'; g.textAlign = 'center'; g.textBaseline = 'middle';
+        g.fillText('U', w / 2, h / 2 + 3);
+      });
+      checkerTex = canvasTexture(64, 8, (g, w, h) => {
+        for (let k = 0; k < 16; k++) {
+          g.fillStyle = (k + (k > 7 ? 1 : 0)) % 2 ? '#f4f5f7' : '#0a0a0a';
+          g.fillRect((k % 8) * 8, k > 7 ? 4 : 0, 8, 4);
+        }
+      });
+    }
+
+    // Auto visto en 3D. Mide L x W = 38 x 20: cabe en el círculo de colisión
+    // del servidor (radio 20). El frente mira a +x.
+    function makeCar(p) {
+      signTextures();
+      const L = world.playerRadius * 1.9, W = world.playerRadius;
+      const group = new THREE.Group();
+      const bodyMat = lambert(carColor(p));
+      const body = shadowed(new THREE.Mesh(new THREE.BoxGeometry(L, 8, W), bodyMat));
+      body.position.y = 7;
+      group.add(body);
+      // Cabina con vidrios oscuros y techo del color del auto
+      const cabin = shadowed(new THREE.Mesh(new THREE.BoxGeometry(L * 0.5, 6.5, W * 0.86), lambert('#1c2532')));
+      cabin.position.set(-L * 0.05, 14.2, 0);
+      group.add(cabin);
+      const roof = shadowed(new THREE.Mesh(new THREE.BoxGeometry(L * 0.44, 1.2, W * 0.8), bodyMat));
+      roof.position.set(-L * 0.05, 18, 0);
+      group.add(roof);
+      // Piezas que se ocultan en MI auto con la cámara en primera persona
+      // (la cámara va dentro de la cabina; se sigue viendo el capó)
+      const upper = [cabin, roof];
+      // Ruedas
+      const wheelGeo = new THREE.CylinderGeometry(4, 4, 3, 14);
+      const wheelMat = lambert('#0d0d0f');
+      for (const wx of [-L * 0.3, L * 0.3]) {
+        for (const wz of [-W / 2, W / 2]) {
+          const wheel = shadowed(new THREE.Mesh(wheelGeo, wheelMat), true, false);
+          wheel.rotation.x = Math.PI / 2;
+          wheel.position.set(wx, 4, wz);
+          group.add(wheel);
+        }
+      }
+      // Faros y luces traseras
+      const lightGeo = new THREE.BoxGeometry(1, 2.5, 4);
+      for (const z of [-W * 0.32, W * 0.32]) {
+        const head = new THREE.Mesh(lightGeo, lambert('#fff6b0', { emissive: '#fff1a0' }));
+        head.position.set(L / 2 + 0.3, 8, z);
+        group.add(head);
+        const tail = new THREE.Mesh(lightGeo, lambert('#ff3b3b', { emissive: '#a30f0f' }));
+        tail.position.set(-L / 2 - 0.3, 8, z);
+        group.add(tail);
+      }
+      if (p.vehicle === 'taxi') {
+        // Letrero TAXI sobre el techo y franja de cuadros a los costados
+        const signMat = new THREE.MeshLambertMaterial({ map: taxiSignTex, emissive: '#3a2a00' });
+        const dark = lambert('#0a0a0a');
+        // Atravesado sobre el techo: el texto mira hacia adelante y hacia atrás (±x)
+        const sign = shadowed(new THREE.Mesh(new THREE.BoxGeometry(5, 5, 12), [signMat, signMat, dark, dark, dark, dark]));
+        sign.position.set(-L * 0.05, 21, 0);
+        group.add(sign);
+        upper.push(sign);
+        const stripe = new THREE.Mesh(new THREE.BoxGeometry(L * 0.62, 2, W + 0.3), new THREE.MeshLambertMaterial({ map: checkerTex }));
+        stripe.position.set(0, 8.5, 0);
+        group.add(stripe);
+      } else {
+        const signMat = new THREE.MeshLambertMaterial({ map: uberSignTex });
+        const sign = shadowed(new THREE.Mesh(new THREE.BoxGeometry(5, 5, 5), signMat));
+        sign.position.set(-L * 0.05, 21, 0);
+        group.add(sign);
+        upper.push(sign);
+      }
+      // Aro blanco en el piso: marca MI auto
+      const ring = new THREE.Mesh(new THREE.RingGeometry(world.playerRadius + 3, world.playerRadius + 5.5, 40),
+        new THREE.MeshBasicMaterial({ color: '#ffffff', transparent: true, opacity: 0.85 }));
+      ring.rotation.x = -Math.PI / 2;
+      ring.position.y = 0.4;
+      ring.visible = false;
+
+      const label = document.createElement('div');
+      label.className = 'car-label';
+      labelsLayer.append(label);
+
+      scene.add(group);
+      scene.add(ring);
+      return { group, bodyMat, color: carColor(p), vehicle: p.vehicle, label, ring, upper, text: '' };
+    }
+
+    // Nombre, mood, puntaje y badge del provider sobre el auto (HTML: nítido y
+    // con textContent, sin riesgo de XSS)
+    function updateLabel(car, p, isMe) {
+      const mood = safeMood((p.extras || {}).mood);
+      const text = `${p.provider === 'google' ? 'G' : '🔑'}|${p.username}${mood ? ` ${mood}` : ''} · ${p.score || 0}|${isMe}`;
+      if (text === car.text) return;
+      car.text = text;
+      car.label.textContent = '';
+      const badge = document.createElement('span');
+      badge.className = `badge ${p.provider === 'google' ? 'google' : 'local'}`;
+      badge.textContent = p.provider === 'google' ? 'G' : '🔑';
+      const name = document.createElement('span');
+      name.textContent = `${p.username}${mood ? ` ${mood}` : ''} · ${p.score || 0}`;
+      car.label.append(badge, name);
+      car.label.classList.toggle('is-me', isMe);
+    }
+
+    function removeCar(userId) {
+      const car = cars.get(userId);
+      if (!car) return;
+      scene.remove(car.group);
+      scene.remove(car.ring);
+      car.label.remove();
+      cars.delete(userId);
+    }
+
+    // ----- Pasajero y flecha guía -----
+    // Ropa, piel y pelo: cada pasajero nuevo (otra posición) se viste distinto
+    const SHIRTS = ['#e8505b', '#4f8fe0', '#2ebf91', '#f2a541', '#9b6ade', '#f4f5f7', '#ef6fa8'];
+    const PANTS = ['#2d3a5c', '#3b3b3b', '#5a4632', '#1f4d3a', '#6b7280'];
+    const SKINS = ['#f1c7a3', '#d9a273', '#a86b44', '#7a4a2c', '#f6d7bd'];
+    const HAIRS = ['#2b1b10', '#5a3a1e', '#0f0f0f', '#c9a15a', '#8a3b1e', '#9aa0a6'];
+
+    // Persona de pie (≈1,70 m a la escala de los autos), de frente hacia +z,
+    // con el brazo derecho levantado pidiendo el auto
+    function makePassenger() {
+      const g = new THREE.Group();
+      const mats = { shirt: lambert(SHIRTS[0]), pants: lambert(PANTS[0]), skin: lambert(SKINS[0]), hair: lambert(HAIRS[0]) };
+      const part = (geo, mat, x, y, z = 0) => {
+        const m = shadowed(new THREE.Mesh(geo, mat));
+        m.position.set(x, y, z);
+        g.add(m);
+        return m;
+      };
+      // Piernas y zapatos
+      const legGeo = new THREE.CylinderGeometry(1.05, 0.95, 7, 10);
+      part(legGeo, mats.pants, -1.35, 4.1);
+      part(legGeo, mats.pants, 1.35, 4.1);
+      const shoeGeo = new THREE.BoxGeometry(2.1, 1.1, 3.4);
+      const shoeMat = lambert('#1d1d1f');
+      part(shoeGeo, shoeMat, -1.35, 0.55, 0.5);
+      part(shoeGeo, shoeMat, 1.35, 0.55, 0.5);
+      // Torso, cuello y cabeza con pelo y ojos
+      part(new THREE.BoxGeometry(5.8, 7, 3.4), mats.shirt, 0, 11);
+      part(new THREE.CylinderGeometry(0.9, 0.9, 1.2, 8), mats.skin, 0, 15.1);
+      part(new THREE.SphereGeometry(2.4, 16, 12), mats.skin, 0, 17.4);
+      const hair = part(new THREE.SphereGeometry(2.55, 16, 10, 0, Math.PI * 2, 0, Math.PI / 2.1), mats.hair, 0, 17.6, -0.15);
+      hair.castShadow = false;
+      const eyeGeo = new THREE.SphereGeometry(0.32, 8, 6);
+      const eyeMat = lambert('#111111');
+      part(eyeGeo, eyeMat, -0.85, 17.7, 2.15);
+      part(eyeGeo, eyeMat, 0.85, 17.7, 2.15);
+      // Brazo izquierdo abajo
+      const armGeo = new THREE.CylinderGeometry(0.75, 0.7, 6.4, 8);
+      const left = part(armGeo, mats.shirt, -3.7, 10.9);
+      left.rotation.z = 0.12;
+      part(new THREE.SphereGeometry(0.85, 8, 6), mats.skin, -4.1, 7.5);
+      // Brazo derecho levantado (gira desde el hombro: saluda)
+      const shoulder = new THREE.Group();
+      shoulder.position.set(3.2, 14, 0);
+      const right = shadowed(new THREE.Mesh(armGeo, mats.shirt));
+      right.position.y = 3.2;
+      const hand = shadowed(new THREE.Mesh(new THREE.SphereGeometry(0.9, 8, 6), mats.skin));
+      hand.position.y = 6.8;
+      shoulder.add(right, hand);
+      g.add(shoulder);
+
+      // Marcador amarillo flotando encima y anillo que late en el piso
+      const marker = new THREE.Mesh(new THREE.ConeGeometry(3.2, 6.5, 4), lambert('#ffc928', { emissive: '#8a6400' }));
+      marker.rotation.x = Math.PI;
+      marker.position.y = 28;
+      const pulse = new THREE.Mesh(new THREE.RingGeometry(world.passengerRadius + 2, world.passengerRadius + 4, 40),
+        new THREE.MeshBasicMaterial({ color: '#ffc928', transparent: true, opacity: 0.8 }));
+      pulse.rotation.x = -Math.PI / 2;
+      pulse.position.y = 0.5;
+      const root = new THREE.Group();
+      g.scale.setScalar(0.85);
+      root.add(g, marker, pulse);
+      scene.add(root);
+      return { group: root, body: g, shoulder, marker, pulse, mats, key: '' };
+    }
+
+    // Misma posición = mismo pasajero: los colores salen de su posición
+    function dressPassenger(obj, pos) {
+      const key = `${pos.x},${pos.y}`;
+      if (obj.key === key) return;
+      obj.key = key;
+      const h = Math.abs(Math.round(pos.x * 7 + pos.y * 13));
+      obj.mats.shirt.color.set(SHIRTS[h % SHIRTS.length]);
+      obj.mats.pants.color.set(PANTS[(h >> 3) % PANTS.length]);
+      obj.mats.skin.color.set(SKINS[(h >> 5) % SKINS.length]);
+      obj.mats.hair.color.set(HAIRS[(h >> 7) % HAIRS.length]);
+    }
+
+    function makeGuideArrow() {
+      const shape = new THREE.Shape();
+      shape.moveTo(10, 0); shape.lineTo(-6, -8); shape.lineTo(-2, 0); shape.lineTo(-6, 8); shape.closePath();
+      const geo = new THREE.ShapeGeometry(shape);
+      geo.rotateX(-Math.PI / 2);
+      const arrow = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: '#ffc928', side: THREE.DoubleSide }));
+      arrow.position.y = 1;
+      scene.add(arrow);
+      return arrow;
+    }
+
+    function updatePassenger(pos, now, myPos) {
+      if (!passengerObj) passengerObj = makePassenger();
+      dressPassenger(passengerObj, pos);
+      const p = toScene(pos.x, pos.y);
+      passengerObj.group.position.set(p.x, 0, p.z);
+      // Mira hacia mi auto y saluda moviendo el brazo
+      if (myPos) passengerObj.body.rotation.y = Math.atan2(myPos.x - pos.x, myPos.y - pos.y);
+      passengerObj.shoulder.rotation.z = -0.45 - Math.sin(now / 160) * 0.35;
+      passengerObj.marker.position.y = 28 + Math.sin(now / 250) * 2.5;
+      passengerObj.marker.rotation.y = now / 400;
+      const t = (now / 900) % 1;
+      passengerObj.pulse.scale.setScalar(1 + t * 2.2);
+      passengerObj.pulse.material.opacity = 0.8 * (1 - t);
+    }
+
+    function updateGuide(x, y, target) {
+      if (!guideArrow) guideArrow = makeGuideArrow();
+      const dist = Math.hypot(target.x - x, target.y - y);
+      guideArrow.visible = dist > world.playerRadius * 4;
+      if (!guideArrow.visible) return;
+      const a = Math.atan2(target.y - y, target.x - x);
+      const d = world.playerRadius + 20;
+      const p = toScene(x + Math.cos(a) * d, y + Math.sin(a) * d, 1);
+      guideArrow.position.copy(p);
+      guideArrow.rotation.y = -a;
+    }
+
+    // ----- Cronómetro de la sesión -----
+    // El coordinador avisa cuánto le queda a la sesión (mensaje 'session') al
+    // conectar y cada vez que cambia la duración (JWT_EXPIRES_IN o
+    // SESSION_MAX_AGE en caliente). Llega el tiempo RESTANTE: se suma al reloj
+    // de este navegador, así no importa si los relojes de los equipos difieren.
+    let sessionEndsAt = null; // performance.now() en que se cierra; null = sin límite
+    let sessionTimerText = '';
+    const sessionTimerEl = document.getElementById('session-timer');
+
+    function formatRemaining(ms) {
+      const total = Math.max(0, Math.ceil(ms / 1000));
+      const h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60), sec = total % 60;
+      const pad = (n) => String(n).padStart(2, '0');
+      return h ? `${h}:${pad(m)}:${pad(sec)}` : `${pad(m)}:${pad(sec)}`;
+    }
+
+    function updateSessionTimer(now) {
+      if (sessionEndsAt === null) { sessionTimerEl.hidden = true; return; }
+      const left = sessionEndsAt - now;
+      const text = `⏱ Sesión: ${formatRemaining(left)}`;
+      if (text !== sessionTimerText) {
+        sessionTimerText = text;
+        sessionTimerEl.textContent = text;
+      }
+      sessionTimerEl.hidden = false;
+      // Último minuto en amarillo, últimos 10 s en rojo
+      sessionTimerEl.classList.toggle('warn', left <= 60000 && left > 10000);
+      sessionTimerEl.classList.toggle('danger', left <= 10000);
+    }
+
+    // ----- Radar -----
+    // Círculo centrado en MI auto con lo que hay a RADAR_RANGE px: manzanas,
+    // autos (taxi amarillo, Uber verde) y el pasajero. Si el pasajero está más
+    // lejos, una flecha en el borde apunta hacia él. Debajo, la distancia.
+    // En primera persona gira con el auto (adelante = arriba, como un GPS);
+    // en las otras vistas el norte queda arriba. Se redibuja ~20 veces/s.
+    const radarBox = document.getElementById('radar');
+    const radar = document.getElementById('radar-canvas');
+    const radarInfo = document.getElementById('radar-info');
+    const RADAR_RANGE = 650;          // px del mundo que cubre el radio del radar
+    const PX_PER_METER = 8.4;         // escala: un auto (38 px) mide ~4,5 m
+    const RADAR_COLORS = { casas: '#7a5242', conjunto: '#8a6050', edificio: '#5d6880', parque: '#3a7d45' };
+    let radarAt = 0, radarInfoText = '';
+
+    function showRadar() { radarBox.hidden = false; } // se llama al recibir 'welcome'
+
+    function updateRadar(now, players, passenger) {
+      if (radarBox.hidden || now - radarAt < 50) return;
+      radarAt = now;
+      const me = players.find((p) => String(p.userId) === myUserId);
+      if (!me) return;
+      const g = radar.getContext('2d');
+      const R = radar.width / 2;
+      const k = (R - 6) / RADAR_RANGE; // px del radar por px del mundo
+      // Rotación: en primera persona el rumbo del auto queda hacia arriba
+      const rot = cameraMode === 'primera' ? -fpYaw - Math.PI / 2 : 0;
+      const toRadar = (x, y) => {
+        const dx = (x - me.x) * k, dy = (y - me.y) * k;
+        return [R + dx * Math.cos(rot) - dy * Math.sin(rot), R + dx * Math.sin(rot) + dy * Math.cos(rot)];
+      };
+
+      g.clearRect(0, 0, radar.width, radar.height);
+      g.save();
+      g.beginPath(); g.arc(R, R, R - 2, 0, Math.PI * 2); g.clip();
+      g.fillStyle = '#22252c';
+      g.fillRect(0, 0, radar.width, radar.height);
+      // Manzanas cercanas (rotadas con el radar)
+      g.save();
+      g.translate(R, R);
+      g.rotate(rot);
+      for (const b of world.blocks) {
+        if (Math.abs(b.x + b.size / 2 - me.x) > RADAR_RANGE + b.size || Math.abs(b.y + b.size / 2 - me.y) > RADAR_RANGE + b.size) continue;
+        g.fillStyle = RADAR_COLORS[b.type] || '#666';
+        g.fillRect((b.x - me.x) * k, (b.y - me.y) * k, b.size * k, b.size * k);
+      }
+      // Borde del mundo
+      g.strokeStyle = '#d23a2a';
+      g.lineWidth = 2;
+      g.strokeRect(-me.x * k, -me.y * k, world.width * k, world.height * k);
+      g.restore();
+      // Anillos de distancia y barrida de radar
+      g.strokeStyle = 'rgba(46, 230, 166, .25)';
+      g.lineWidth = 1;
+      for (const f of [1 / 3, 2 / 3]) { g.beginPath(); g.arc(R, R, (R - 6) * f, 0, Math.PI * 2); g.stroke(); }
+      const sweep = (now / 1500) % 1 * Math.PI * 2;
+      const grad = g.createLinearGradient(R, R, R + Math.cos(sweep) * R, R + Math.sin(sweep) * R);
+      grad.addColorStop(0, 'rgba(46, 230, 166, .0)');
+      grad.addColorStop(1, 'rgba(46, 230, 166, .35)');
+      g.fillStyle = grad;
+      g.beginPath(); g.moveTo(R, R); g.arc(R, R, R, sweep - 0.5, sweep); g.closePath(); g.fill();
+      // Otros autos
+      for (const p of players) {
+        if (p === me) continue;
+        const [x, y] = toRadar(p.x, p.y);
+        g.fillStyle = p.vehicle === 'uber' ? '#2ee6a6' : '#ffc928';
+        g.beginPath(); g.arc(x, y, 3.5, 0, Math.PI * 2); g.fill();
+      }
+      g.restore();
+
+      // Pasajero: punto que late dentro del radar o flecha en el borde
+      let text = '';
+      if (passenger) {
+        const dist = Math.hypot(passenger.x - me.x, passenger.y - me.y);
+        const [px, py] = toRadar(passenger.x, passenger.y);
+        const ang = Math.atan2(py - R, px - R);
+        g.fillStyle = '#ffc928';
+        if (dist <= RADAR_RANGE) {
+          const pulse = 4 + ((now / 450) % 1) * 7;
+          g.strokeStyle = '#ffc928';
+          g.lineWidth = 2;
+          g.beginPath(); g.arc(px, py, pulse, 0, Math.PI * 2); g.stroke();
+          g.beginPath(); g.arc(px, py, 4, 0, Math.PI * 2); g.fill();
+        } else {
+          g.save();
+          g.translate(R + Math.cos(ang) * (R - 13), R + Math.sin(ang) * (R - 13));
+          g.rotate(ang);
+          g.beginPath(); g.moveTo(9, 0); g.lineTo(-6, -7); g.lineTo(-6, 7); g.closePath(); g.fill();
+          g.restore();
+        }
+        text = `🙋 Pasajero a ${Math.round(dist / PX_PER_METER)} m`;
+      }
+      // Mi auto en el centro: triángulo hacia donde va
+      const myRot = (me.angle || 0) + rot;
+      g.save();
+      g.translate(R, R);
+      g.rotate(myRot);
+      g.fillStyle = '#ffffff';
+      g.beginPath(); g.moveTo(8, 0); g.lineTo(-5, -5.5); g.lineTo(-2.5, 0); g.lineTo(-5, 5.5); g.closePath(); g.fill();
+      g.restore();
+      // Aro exterior y "N" (o la flecha de adelante en primera persona)
+      g.strokeStyle = 'rgba(255, 255, 255, .55)';
+      g.lineWidth = 2;
+      g.beginPath(); g.arc(R, R, R - 2, 0, Math.PI * 2); g.stroke();
+      g.fillStyle = '#ffffff';
+      g.font = 'bold 12px Arial';
+      g.textAlign = 'center';
+      g.textBaseline = 'middle';
+      const [nx, ny] = [R + Math.cos(rot - Math.PI / 2) * (R - 11), R + Math.sin(rot - Math.PI / 2) * (R - 11)];
+      g.fillText('N', nx, ny);
+
+      if (text !== radarInfoText) { radarInfoText = text; radarInfo.textContent = text; }
+    }
+
+    // ----- Partida Uber vs Taxi -----
+    // El servidor manda en cada state la fase de la ronda y el tiempo que le
+    // queda (relativo). Entre dos states se descuenta con el reloj local para
+    // que el contador baje suave.
+    const matchHud = document.getElementById('match-hud');
+    const matchEnd = document.getElementById('match-end');
+    const WINNER_TEXT = { uber: '🏆 ¡GANA UBER!', taxi: '🏆 ¡GANA TAXI!', empate: '🤝 ¡EMPATE!' };
+    let matchHudText = '', matchEndKey = '';
+
+    function updateMatchHud(now) {
+      const m = lastState && lastState.match;
+      if (!m || m.phase === 'waiting') { matchHud.hidden = true; matchEnd.hidden = true; return; }
+      const left = Math.max(0, m.remainingMs - (now - lastStateAt));
+      if (m.phase === 'playing') {
+        const text = `🏁 Ronda ${m.round} · ${formatRemaining(left)}`;
+        if (text !== matchHudText) { matchHudText = text; matchHud.textContent = text; }
+        matchHud.hidden = false;
+        matchHud.classList.toggle('ending', left <= 15000);
+        matchEnd.hidden = true;
+        return;
+      }
+      // Fin de ronda: cartel con ganador, marcador, podio y cuenta para la próxima
+      matchHud.hidden = true;
+      const r = m.result || { winner: 'empate', teams: { uber: 0, taxi: 0 }, top: [] };
+      const key = `${m.round}|${r.winner}|${r.teams.uber}|${r.teams.taxi}`;
+      if (key !== matchEndKey) {
+        matchEndKey = key;
+        document.getElementById('match-end-round').textContent = `Fin de la ronda ${m.round}`;
+        const winnerEl = document.getElementById('match-end-winner');
+        winnerEl.textContent = WINNER_TEXT[r.winner] || WINNER_TEXT.empate;
+        winnerEl.className = `match-winner ${r.winner}`;
+        document.getElementById('match-end-score').textContent = `UBER ${r.teams.uber} · TAXI ${r.teams.taxi}`;
+        const podium = document.getElementById('match-end-podium');
+        podium.textContent = '';
+        const medals = ['🥇', '🥈', '🥉'];
+        r.top.forEach((t, i) => {
+          const li = document.createElement('li');
+          li.textContent = `${medals[i]} ${t.username} (${t.vehicle === 'uber' ? 'Uber' : 'Taxi'}) · ${t.score} 🙋`;
+          podium.append(li);
+        });
+        if (!r.top.length) {
+          const li = document.createElement('li');
+          li.textContent = 'Nadie recogió pasajeros esta ronda';
+          podium.append(li);
+        }
+      }
+      document.getElementById('match-end-next').textContent = `Nueva ronda en ${Math.ceil(left / 1000)} s`;
+      matchEnd.hidden = false;
+    }
+
+    // ----- HUD (marcador y avisos) -----
+    let teamsText = '';
+    function updateTeams(teams) {
+      const text = `${teams.uber}|${teams.taxi}`;
+      if (text === teamsText) return;
+      teamsText = text;
+      teamsHud.textContent = '';
+      const uber = document.createElement('span');
+      uber.className = 'team-uber';
+      uber.textContent = `UBER ${teams.uber}`;
+      const sep = document.createElement('span');
+      sep.className = 'sep';
+      sep.textContent = '·';
+      const taxi = document.createElement('span');
+      taxi.className = 'team-taxi';
+      taxi.textContent = `TAXI ${teams.taxi}`;
+      teamsHud.append(uber, sep, taxi);
+      teamsHud.hidden = false;
+    }
+
+    function updateToast(now) {
+      const show = toast && now < toast.until;
+      toastEl.hidden = !show;
+      if (!show) return;
+      if (toastEl.textContent !== toast.text) toastEl.textContent = toast.text;
+      toastEl.classList.toggle('mine', toast.mine);
+    }
+
+    // ----- Cámara -----
+    // 'ciudad': toda la ciudad en diagonal. 'seguir': detrás y arriba de MI auto.
+    // En esos dos el norte queda arriba y W/A/S/D son arriba/izquierda/abajo/
+    // derecha en pantalla.
+    // 'primera': desde el asiento del conductor. Ahí las teclas son relativas
+    // al auto (W acelera, A/D giran 45°, S frena) y el cliente las traduce a
+    // la misma intención {x, y} de siempre: el servidor no se entera del modo.
+    const CAMERA_MODES = ['ciudad', 'seguir', 'primera'];
+    const CAMERA_LABELS = { ciudad: '🎥 Vista de la ciudad', seguir: '🎥 Seguir mi auto', primera: '🎥 Primera persona' };
+    // Rumbo de manejo en primera persona: 8 direcciones cada 45°. 0 = este y,
+    // como en el mundo y crece hacia abajo, 2 = sur y 6 = norte.
+    const DIRS8 = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]];
+    let driveHeading = 0;
+    let myAngle = 0;             // último ángulo de MI auto que mandó el servidor
+    let fpYaw = 0;               // hacia dónde mira la cámara (se suaviza al girar)
+    let onCameraModeChange = null; // lo define el código de input
+    const keysHint = document.querySelector('.keys');
+
+    function headingFromAngle(a) {
+      return ((Math.round(a / (Math.PI / 4)) % 8) + 8) % 8;
+    }
+
+    function setCameraMode(mode) {
+      const prevMode = cameraMode;
+      cameraMode = mode;
+      cameraBtn.textContent = CAMERA_LABELS[mode];
+      try { localStorage.setItem('camera-mode', mode); } catch (_) {}
+      if (mode === 'primera' && prevMode !== 'primera') {
+        // Arranca mirando hacia donde apunta el auto
+        driveHeading = headingFromAngle(myAngle);
+        fpYaw = driveHeading * (Math.PI / 4);
+      }
+      keysHint.textContent = '';
+      const hint = mode === 'primera'
+        ? [['W', ' acelera · '], ['S', ' reversa · '], ['A', ''], ['D', ' giran · recoge al pasajero 🙋']]
+        : [['W', ''], ['A', ''], ['S', ''], ['D', ' o las flechas · recoge al pasajero 🙋 antes que los demás']];
+      keysHint.append(mode === 'primera' ? 'Al volante: ' : 'Maneja con ');
+      for (const [key, text] of hint) {
+        const kbd = document.createElement('kbd');
+        kbd.textContent = key;
+        keysHint.append(kbd, text);
+      }
+      applyModeLook();
+      if (onCameraModeChange) onCameraModeChange();
+    }
+    cameraBtn.addEventListener('click', () => {
+      setCameraMode(CAMERA_MODES[(CAMERA_MODES.indexOf(cameraMode) + 1) % CAMERA_MODES.length]);
+      cameraBtn.blur(); // que la barra espaciadora/Enter no vuelvan a cambiar el modo
+    });
+    setCameraMode(cameraMode);
+    let headingSynced = false; // el rumbo inicial se toma del primer state
+
+    // ----- Pantalla completa -----
+    // El navegador solo la permite después de un clic o una tecla del usuario.
+    // Se pone en pantalla completa el contenedor del juego (lienzo, etiquetas,
+    // marcador y botones); Esc o el mismo botón la cierran.
+    const fullscreenBtn = document.getElementById('fullscreen');
+    function toggleFullscreen() {
+      if (document.fullscreenElement) document.exitFullscreen();
+      else if (stage.requestFullscreen) stage.requestFullscreen().catch(() => {});
+    }
+    fullscreenBtn.addEventListener('click', () => { toggleFullscreen(); fullscreenBtn.blur(); });
+    if (!document.fullscreenEnabled) fullscreenBtn.hidden = true;
+    document.addEventListener('fullscreenchange', () => {
+      const full = document.fullscreenElement === stage;
+      fullscreenBtn.textContent = full ? '✕ Salir (Esc)' : '⛶ Pantalla completa';
+      resize3D();
+    });
+    // F: pantalla completa · C: cambiar cámara (no mientras se escribe en un campo)
+    window.addEventListener('keydown', (e) => {
+      if (e.repeat || e.ctrlKey || e.metaKey || e.altKey || e.target.tagName === 'INPUT') return;
+      if (e.code === 'KeyF') { e.preventDefault(); toggleFullscreen(); }
+      if (e.code === 'KeyC') { e.preventDefault(); cameraBtn.click(); }
+    });
+
+    // Desde el asiento se ve el cielo: fondo y niebla claros, lente más abierta
+    function applyModeLook() {
+      if (!scene || !world) return;
+      const fp = cameraMode === 'primera';
+      const span = Math.max(world.width, world.height);
+      const sky = fp ? '#9cc3e6' : '#10131a';
+      scene.background = new THREE.Color(sky);
+      // La niebla y el alcance de la cámara crecen con el tamaño del mundo
+      scene.fog = fp ? new THREE.Fog(sky, 350, 1300) : new THREE.Fog(sky, span * 1.3, span * 2.8);
+      camera.fov = fp ? 72 : 45;
+      camera.far = Math.max(5000, span * 3.2);
+      camera.updateProjectionMatrix();
+    }
+
+    // El sol (y su cuadrado de sombras) acompaña a lo que mira la cámara
+    function updateSun() {
+      if (!sun) return;
+      sun.target.position.set(camTarget.x, 0, camTarget.z);
+      sun.position.set(camTarget.x - 350, 700, camTarget.z + 300);
+    }
+
+    function cameraGoal(myPos) {
+      if (cameraMode === 'primera' && myPos) {
+        // Ojos del conductor: dentro de la cabina, mirando hacia adelante
+        const fx = Math.cos(fpYaw), fy = Math.sin(fpYaw);
+        return {
+          pos: toScene(myPos.x + fx * 3, myPos.y + fy * 3, 15.5),
+          look: toScene(myPos.x + fx * 160, myPos.y + fy * 160, 8),
+          instant: true,
+        };
+      }
+      if (cameraMode === 'seguir' && myPos) {
+        const look = toScene(myPos.x, myPos.y, 0);
+        return { look, pos: look.clone().add(new THREE.Vector3(0, 230, 210)) };
+      }
+      const span = Math.max(world.width, world.height);
+      return { look: new THREE.Vector3(0, 0, 20), pos: new THREE.Vector3(0, span * 1.02, span * 0.62) };
+    }
+
+    // Al recibir el mundo la cámara se ubica de una vez; después se mueve suave
+    function snapCamera() {
+      const { look, pos } = cameraGoal(null);
+      camera.position.copy(pos);
+      camTarget.copy(look);
+      camera.lookAt(camTarget);
+      applyModeLook();
+      updateSun();
+    }
+
+    function updateCamera(myPos) {
+      if (cameraMode === 'primera') fpYaw = lerpAngle(fpYaw, driveHeading * (Math.PI / 4), 0.18);
+      const { look, pos, instant } = cameraGoal(myPos);
+      // En primera persona la cámara va pegada al auto (sin retraso)
+      camera.position.lerp(pos, instant ? 1 : 0.12);
+      camTarget.lerp(look, instant ? 1 : 0.12);
+      camera.lookAt(camTarget);
+      updateSun();
     }
 
     // Ángulo intermedio por el camino más corto (de 170° a -170° gira 20°, no 340°)
@@ -509,24 +1153,78 @@
       return a + d * t;
     }
 
+    // Proyecta un punto de la escena a píxeles del lienzo (para las etiquetas)
+    const projected = newVector();
+    const LABEL_MAX_DIST = 1100; // más lejos no se ve el nombre (ciudad grande)
+    function placeLabel(el, x, y, height) {
+      const point = toScene(x, y, height);
+      projected.copy(point).project(camera);
+      const visible = projected.z < 1 && camera.position.distanceTo(point) < LABEL_MAX_DIST;
+      el.style.display = visible ? '' : 'none';
+      if (!visible) return;
+      el.style.transform = `translate(${((projected.x + 1) / 2) * viewSize.w}px, ${((1 - projected.y) / 2) * viewSize.h}px) translate(-50%, -100%)`;
+    }
+
     function render() {
       requestAnimationFrame(render);
-      if (!world) return;
-      drawBackground();
-      if (!lastState) return;
-      if (lastState.passenger) drawPassenger(lastState.passenger);
-      // Interpolación de dibujo: avanza de prevState a lastState durante un tick.
-      const alpha = Math.min((performance.now() - lastStateAt) / (1000 / world.tickRate), 1);
-      const prev = new Map(prevState ? prevState.players.map((p) => [p.userId, p]) : []);
-      for (const p of lastState.players) {
-        const a = prev.get(p.userId) || p;
-        const x = a.x + (p.x - a.x) * alpha;
-        const y = a.y + (p.y - a.y) * alpha;
-        drawPlayer(p, x, y, lerpAngle(a.angle || 0, p.angle || 0, alpha));
-        if (String(p.userId) === myUserId && lastState.passenger) drawGuide(x, y, lastState.passenger);
+      updateSessionTimer(performance.now()); // aunque no haya 3D
+      updateMatchHud(performance.now());
+      if (!world || !renderer) return;
+      const now = performance.now();
+      let myPos = null;
+      if (lastState) {
+        // Interpolación de dibujo: avanza de prevState a lastState durante un tick.
+        const alpha = Math.min((now - lastStateAt) / (1000 / world.tickRate), 1);
+        const prev = new Map(prevState ? prevState.players.map((p) => [p.userId, p]) : []);
+        const seen = new Set();
+        for (const p of lastState.players) {
+          const id = String(p.userId);
+          seen.add(id);
+          let car = cars.get(id);
+          // El vehículo no cambia en una sesión, pero si cambió (otro token) se rehace
+          if (car && car.vehicle !== p.vehicle) { removeCar(id); car = null; }
+          if (!car) { car = makeCar(p); cars.set(id, car); }
+          const a = prev.get(p.userId) || p;
+          const x = a.x + (p.x - a.x) * alpha;
+          const y = a.y + (p.y - a.y) * alpha;
+          const angle = lerpAngle(a.angle || 0, p.angle || 0, alpha);
+          const pos = toScene(x, y);
+          car.group.position.set(pos.x, 0, pos.z);
+          car.group.rotation.y = -angle; // en 3D el eje z es el y del servidor
+          const color = carColor(p);
+          if (color !== car.color) { car.color = color; car.bodyMat.color.set(color); }
+          const isMe = id === myUserId;
+          // Primera persona: la cámara está en MI cabina; se ocultan cabina,
+          // techo, letrero, aro y etiqueta (queda el capó a la vista)
+          const insideMe = isMe && cameraMode === 'primera';
+          for (const part of car.upper) part.visible = !insideMe;
+          car.ring.visible = isMe && !insideMe;
+          if (isMe) {
+            car.ring.position.set(pos.x, 0.4, pos.z);
+            myPos = { x, y };
+            myAngle = p.angle || 0;
+            if (!headingSynced) {
+              headingSynced = true;
+              driveHeading = headingFromAngle(myAngle);
+              fpYaw = driveHeading * (Math.PI / 4);
+            }
+          }
+          updateLabel(car, p, isMe);
+          if (insideMe) car.label.style.display = 'none';
+          else placeLabel(car.label, x, y, 34);
+        }
+        for (const id of [...cars.keys()]) if (!seen.has(id)) removeCar(id);
+        if (lastState.passenger) {
+          updatePassenger(lastState.passenger, now, myPos);
+          if (myPos) updateGuide(myPos.x, myPos.y, lastState.passenger);
+          else if (guideArrow) guideArrow.visible = false;
+        }
+        if (lastState.teams) updateTeams(lastState.teams);
+        updateRadar(now, lastState.players, lastState.passenger);
       }
-      if (lastState.teams) drawTeams(lastState.teams);
-      drawToast();
+      updateToast(now);
+      updateCamera(myPos);
+      renderer.render(scene, camera);
     }
     requestAnimationFrame(render);
 
@@ -626,7 +1324,7 @@
       let ws = null;
 
       function send(obj) {
-        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+        if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
       }
 
       // extras_update manda el objeto completo: el servidor reemplaza player.extras
@@ -649,46 +1347,135 @@
       const pressed = new Set();
       let lastDir = { x: 0, y: 0 };
 
-      function sendIntentIfChanged() {
-        const dir = {
-          x: (pressed.has('right') ? 1 : 0) - (pressed.has('left') ? 1 : 0),
-          y: (pressed.has('down') ? 1 : 0) - (pressed.has('up') ? 1 : 0),
+      // Intención que se manda al servidor: dir {x, y} en -1/0/1 y, opcional,
+      // reverse (retroceder sin girar). Solo cambia cómo se leen las teclas:
+      // - vistas desde arriba: teclas absolutas (W = norte, D = este...)
+      // - primera persona: W avanza hacia el rumbo del auto, S da reversa
+      //   (retrocede mirando hacia adelante) y W+S frena
+      function currentIntent() {
+        if (cameraMode === 'primera') {
+          const fwd = pressed.has('up'), back = pressed.has('down');
+          if (fwd === back) return { dir: { x: 0, y: 0 } };
+          const [x, y] = DIRS8[driveHeading];
+          return fwd ? { dir: { x, y } } : { dir: { x: -x, y: -y }, reverse: true };
+        }
+        return {
+          dir: {
+            x: (pressed.has('right') ? 1 : 0) - (pressed.has('left') ? 1 : 0),
+            y: (pressed.has('down') ? 1 : 0) - (pressed.has('up') ? 1 : 0),
+          },
         };
-        // Solo cuando cambia la dirección: mantener una tecla no genera tráfico
-        if (dir.x === lastDir.x && dir.y === lastDir.y) return;
-        lastDir = dir;
-        send({ type: 'intent', intent: { dir } });
       }
+
+      let lastReverse = false;
+      function sendIntentIfChanged() {
+        const intent = currentIntent();
+        const { dir } = intent;
+        const reverse = intent.reverse === true;
+        // Solo cuando cambia: mantener una tecla no genera tráfico
+        if (dir.x === lastDir.x && dir.y === lastDir.y && reverse === lastReverse) return;
+        lastDir = dir;
+        lastReverse = reverse;
+        send({ type: 'intent', intent });
+      }
+
+      // Primera persona: A/D giran 45° al apretar y cada 220 ms mientras se
+      // mantienen (el auto dobla en las esquinas o da la vuelta en 4 pasos)
+      const turnTimers = {};
+      function turn(k) {
+        driveHeading = (driveHeading + (k === 'left' ? 7 : 1)) % 8;
+        sendIntentIfChanged();
+      }
+      function stopTurning(k) {
+        clearInterval(turnTimers[k]);
+        delete turnTimers[k];
+      }
+      // Al cambiar de cámara la misma tecla significa otra cosa: se recalcula
+      onCameraModeChange = () => {
+        stopTurning('left');
+        stopTurning('right');
+        sendIntentIfChanged();
+      };
 
       window.addEventListener('keydown', (e) => {
         const k = KEYMAP[e.code];
         if (!k || e.target.tagName === 'INPUT') return;
         e.preventDefault(); // que las flechas no hagan scroll
+        const first = !pressed.has(k); // keydown se repite mientras se mantiene
         pressed.add(k);
+        if (first && cameraMode === 'primera' && (k === 'left' || k === 'right')) {
+          turn(k);
+          turnTimers[k] = setInterval(() => turn(k), 220);
+          return;
+        }
         sendIntentIfChanged();
       });
       window.addEventListener('keyup', (e) => {
         const k = KEYMAP[e.code];
         if (!k) return;
         pressed.delete(k);
+        stopTurning(k);
         sendIntentIfChanged();
       });
       // Si la pestaña pierde el foco no llega el keyup: frenar al jugador
       window.addEventListener('blur', () => {
         pressed.clear();
+        stopTurning('left');
+        stopTurning('right');
         sendIntentIfChanged();
       });
 
-      function connect() {
+      // ---------- Coordinador (Taller 6) ----------
+      // Antes de abrir el WS se le pregunta al directorio (el auth) a qué
+      // coordinador conectarse: devuelve el menos cargado. Si el WS se cae, NO
+      // se vuelve directo al mismo: se pregunta otra vez, excluyendo el caído.
+      const coordChip = document.getElementById('coord-chip');
+      let reconnectTimer = null;
+      let connectAttempt = 0;
+
+      function setStatus(text, online) {
+        const status = document.getElementById('status');
+        status.textContent = text;
+        status.classList.toggle('online', online);
+      }
+
+      async function pickCoordinator(exclude) {
+        const url = `${AUTH_URL}/coordinator${exclude ? `?exclude=${encodeURIComponent(exclude)}` : ''}`;
+        const res = await fetch(url, { headers: { 'ngrok-skip-browser-warning': 'true' } });
+        // Auth del Taller 5 (sin directorio): un solo coordinador fijo
+        if (res.status === 404 && COORDINATOR_WS) return { coordinatorId: null, publicUrl: COORDINATOR_WS };
+        let data = {};
+        try { data = await res.json(); } catch (_) {}
+        if (!res.ok || typeof data.publicUrl !== 'string') throw new Error(data.error || `HTTP ${res.status}`);
+        return data;
+      }
+
+      async function connect(exclude = null) {
+        clearTimeout(reconnectTimer);
+        const attempt = ++connectAttempt;
+        setStatus('Buscando coordinador…', false);
+        let target;
+        try {
+          target = await pickCoordinator(exclude);
+        } catch (err) {
+          // Sin coordinadores vivos (503) o auth caído: reintentar sin excluir a nadie
+          setStatus('Sin coordinadores disponibles, reintentando…', false);
+          console.log(`[lobby] /coordinator falló (${err.message}); reintento en 2 s`);
+          reconnectTimer = setTimeout(() => connect(null), 2000);
+          return;
+        }
+        // Otro connect() más nuevo (cambio de token) o cierre de sesión en el medio
+        if (attempt !== connectAttempt || loggingOut) return;
+
         // encodeURIComponent: si el token se "ensucia" con caracteres como # o espacios,
         // new WebSocket() lanzaría error en vez de dejar que el coordinador lo rechace.
-        const sock = new WebSocket(`${COORDINATOR_WS}/connect?token=${encodeURIComponent(currentToken)}`);
+        const sock = new WebSocket(`${target.publicUrl}/connect?token=${encodeURIComponent(currentToken)}`);
+        sock.coordinatorId = target.coordinatorId || 'coordinador';
         ws = sock;
 
         sock.onopen = () => {
-          const status = document.getElementById('status');
-          status.textContent = 'En línea';
-          status.classList.add('online');
+          if (sock !== ws) return;
+          setStatus(`En línea · ${sock.coordinatorId}`, true);
         };
 
         sock.onmessage = (event) => {
@@ -696,10 +1483,19 @@
           const msg = JSON.parse(event.data);
           if (msg.type === 'welcome') {
             world = msg.world;
-            cityLayer = null; // se vuelve a dibujar con el mapa recibido
             myUserId = String(msg.you.userId);
-            canvas.width = world.width;
-            canvas.height = world.height;
+            // El coordinador confirma quién es (el que dijo el directorio)
+            if (msg.coordinator && msg.coordinator.id) sock.coordinatorId = msg.coordinator.id;
+            coordChip.textContent = `🖧 Coordinador: ${sock.coordinatorId} · ${world.tickRate} Hz`;
+            coordChip.hidden = false;
+            setStatus(`En línea · ${sock.coordinatorId}`, true);
+            // Se arma la escena 3D con el mapa recibido
+            if (init3D()) {
+              resize3D();
+              buildCity3D();
+              showRadar();
+              snapCamera();
+            }
             // El nombre viene del JWT validado: si el token cambió de usuario, se actualiza
             document.getElementById('me').textContent = msg.you.username;
             const avatar = avatarFor(msg.you.username);
@@ -716,14 +1512,19 @@
             if (Object.keys(myExtras).length) send({ type: 'extras_update', extras: myExtras });
             // Tras reconectar el servidor arranca con intent quieto: reenviar la dirección actual
             lastDir = { x: 0, y: 0 };
+            lastReverse = false;
             sendIntentIfChanged();
           } else if (msg.type === 'state') {
             prevState = lastState;
             lastState = msg;
             lastStateAt = performance.now();
             updateScores(msg.players);
+          } else if (msg.type === 'session') {
+            sessionEndsAt = typeof msg.expiresInMs === 'number' ? performance.now() + msg.expiresInMs : null;
           } else if (msg.type === 'players_update') {
             renderPlayers(msg.players);
+          } else if (msg.type === 'match_start') {
+            toast = { text: `🏁 ¡Empieza la ronda ${msg.round}! Recoge pasajeros para tu equipo`, mine: true, until: performance.now() + 3000 };
           } else if (msg.type === 'pickup') {
             const mine = String(msg.userId) === myUserId;
             toast = {
@@ -752,7 +1553,7 @@
         if (!stored) {
           // Token borrado: equivale a cerrar sesión
           loggingOut = true;
-          ws.close(1000, 'token removed');
+          if (ws) ws.close(1000, 'token removed');
           alert('Sesión terminada: el token fue eliminado.');
           window.location.href = 'login.html';
           return;
@@ -760,8 +1561,9 @@
         console.log('[lobby] el token cambió: reconectando con el nuevo');
         currentToken = stored;
         const old = ws;
-        connect(); // ws ya apunta al socket nuevo: el cierre del viejo se ignora
-        old.close(1000, 'token changed');
+        ws = null; // el cierre del viejo se ignora (onSocketClose compara con ws)
+        if (old) old.close(1000, 'token changed');
+        connect();
       }, TOKEN_CHECK_MS);
 
       function onSocketClose(sock, event) {
@@ -780,12 +1582,21 @@
           alert(event.reason === 'token expired' ? 'Sesión terminada: tu token venció.'
             : event.reason === 'session expired' ? 'Sesión terminada: se superó la duración máxima de la sesión.'
             : 'Sesión terminada: token inválido.');
-        } else {
-          alert('Sesión terminada: se perdió la conexión con el coordinador.');
+          localStorage.removeItem('token');
+          localStorage.removeItem('username');
+          window.location.href = 'login.html';
+          return;
         }
-        localStorage.removeItem('token');
-        localStorage.removeItem('username');
-        window.location.href = 'login.html';
+        // Se cayó el coordinador (o la red): la sesión sigue. Se pide otro
+        // coordinador al directorio, excluyendo el que se cayó.
+        loggingOut = false;
+        const dead = sock.coordinatorId;
+        console.log(`[lobby] se perdió ${dead} (código ${event.code}): buscando otro coordinador`);
+        coordChip.textContent = `🖧 ${dead} caído · reconectando…`;
+        toast = { text: `Se perdió ${dead}: conectando a otro coordinador…`, mine: false, until: performance.now() + 4000 };
+        setStatus('Reconectando…', false);
+        ws = null;
+        reconnectTimer = setTimeout(() => connect(dead === 'coordinador' ? null : dead), 1000);
       }
 
       connect();
@@ -794,7 +1605,8 @@
         loggingOut = true;
         localStorage.removeItem('token');
         localStorage.removeItem('username');
-        ws.close(1000, 'logout');
+        clearTimeout(reconnectTimer);
+        if (ws) ws.close(1000, 'logout');
         window.location.href = 'login.html';
       });
     }

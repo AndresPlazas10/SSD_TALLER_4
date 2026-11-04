@@ -49,6 +49,11 @@ app.get('/config.js', (req, res) => {
 // Dos páginas: login.html (login, registro y Google) y lobby.html (lobby + juego)
 app.get('/', (req, res) => res.redirect('/login.html'));
 app.use(express.static(path.join(__dirname, 'public')));
+// Three.js (vista 3D del juego) se sirve desde node_modules: no depende de un
+// CDN externo el día de la demo. Versión fija en package.json.
+app.get('/vendor/three.min.js', (req, res) => {
+  res.sendFile(path.join(__dirname, 'node_modules', 'three', 'build', 'three.min.js'));
+});
 
 app.listen(PORT, () => {
   console.log(`Cliente en puerto ${PORT}`);
