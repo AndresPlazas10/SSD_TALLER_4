@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Uber vs Taxi · Lobby</title>
+  <title>Uber vs Taxi · Juego</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚕</text></svg>" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -25,21 +25,38 @@
     </div>
   </nav>
 
-  <main class="container">
-    <div class="card">
+  <main class="container game-layout">
+    <section class="card game-card">
       <div class="lobby-head">
-        <h2>🚦 Jugadores en línea</h2>
-        <span class="count-pill"><span id="count">0</span> en la calle</span>
+        <h2>🗺️ La ciudad</h2>
+        <span class="hint keys">Maneja con <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> o las flechas y recoge al pasajero 🙋 antes que los demás</span>
       </div>
-      <ul id="players"></ul>
-      <p class="empty hidden" id="empty">Esperando conductores…</p>
-    </div>
-  </main>
+      <!-- Las dimensiones reales las fija el mensaje 'welcome' del coordinador -->
+      <canvas id="world" width="800" height="600" aria-label="Mapa del juego"></canvas>
+    </section>
 
-  <div class="road" aria-hidden="true">
-    <svg class="car car-uber" viewBox="0 0 122 50"><path d="M8 34 Q8 26 16 25 L34 23 L46 12 Q49 9 54 9 L80 9 Q85 9 88 13 L97 23 L108 25 Q114 26 114 32 L114 36 Q114 38 112 38 L10 38 Q8 38 8 36 Z" fill="#2a2d36" stroke="#4a4f5c"/><path d="M38 23 L48 13 Q50 12 53 12 L64 12 L64 23 Z M68 12 L80 12 Q83 12 85 15 L92 23 L68 23 Z" fill="#7fe9c6" opacity=".55"/><rect x="108" y="27" width="6" height="3" rx="1.5" fill="#fff"/><circle cx="30" cy="38" r="9" fill="#0a0a0a"/><circle cx="92" cy="38" r="9" fill="#0a0a0a"/></svg>
-    <svg class="car car-taxi" viewBox="0 0 122 50"><rect x="54" y="1" width="20" height="8" rx="2" fill="#0a0a0a"/><path d="M8 34 Q8 26 16 25 L34 23 L46 12 Q49 9 54 9 L80 9 Q85 9 88 13 L97 23 L108 25 Q114 26 114 32 L114 36 Q114 38 112 38 L10 38 Q8 38 8 36 Z" fill="#ffd54d" stroke="#0a0a0a" stroke-width="1.5"/><path d="M38 23 L48 13 Q50 12 53 12 L64 12 L64 23 Z M68 12 L80 12 Q83 12 85 15 L92 23 L68 23 Z" fill="#1d2230"/><rect x="108" y="27" width="6" height="3" rx="1.5" fill="#fff"/><circle cx="30" cy="38" r="9" fill="#0a0a0a"/><circle cx="92" cy="38" r="9" fill="#0a0a0a"/></svg>
-  </div>
+    <aside class="side-panel">
+      <!-- Feature extra replicado: color del auto + mood (viajan en extras) -->
+      <section class="card">
+        <h2>🎨 Tu auto</h2>
+        <p class="hint">Todos ven tu color y tu mood en vivo.</p>
+        <label>Color</label>
+        <p class="hint" id="color-hint">Conectando…</p>
+        <div class="swatches" id="swatches"></div>
+        <label>Mood</label>
+        <div class="moods" id="moods"></div>
+      </section>
+
+      <section class="card">
+        <div class="lobby-head">
+          <h2>🚦 En línea</h2>
+          <span class="count-pill"><span id="count">0</span> en la calle</span>
+        </div>
+        <ul id="players"></ul>
+        <p class="empty hidden" id="empty">Esperando conductores…</p>
+      </section>
+    </aside>
+  </main>
 
   <!-- COORDINATOR_WS viene del .env del cliente (server.js lo sirve como /config.js) -->
   <script src="config.js"></script>
@@ -48,18 +65,74 @@
     const username = localStorage.getItem('username') || '';
     const { COORDINATOR_WS } = window.APP_CONFIG;
 
-    // Color de avatar estable a partir del nombre (solo decorativo)
-    const AVATAR_COLORS = ['#ffc928', '#2ee6a6', '#6aa8ff', '#ff8a5c', '#c79bff', '#ff6fa8'];
-    function avatarFor(name) {
+    // Último 'state' recibido del servidor. Es lo único que se dibuja.
+    // Modificarlo desde DevTools solo cambia ESTA pantalla: el servidor es la
+    // fuente de verdad y lo sobrescribe en el próximo tick (demo de autoridad).
+    let lastState = null;
+    // State anterior + hora de llegada del último: solo para interpolar el dibujo
+    // entre dos posiciones que ya mandó el servidor (no se predice nada).
+    let prevState = null;
+    let lastStateAt = 0;
+    // { width, height, playerRadius, tickRate, passengerRadius, cell, obstacles } desde 'welcome'
+    let world = null;
+    let myUserId = null;
+    // Aviso de "X recogió al pasajero" (mensaje 'pickup'), se muestra unos segundos
+    let toast = null;
+
+    const COLORS = ['#ffc928', '#2ee6a6', '#6aa8ff', '#ff8a5c', '#c79bff', '#ff6fa8', '#f4f5f7'];
+    const VEHICLE_COLORS = { taxi: '#ffc928', uber: '#23262e' };
+    const VEHICLE_LABELS = { taxi: '🚕 Taxi', uber: '🚘 Uber' };
+    const MOODS = ['', '😎', '🤑', '😡', '😴', '🥳', '🚀'];
+
+    // Color estable a partir del nombre (cuando el jugador no eligió uno)
+    function colorFor(name) {
       let h = 0;
       for (const ch of name) h = (h * 31 + ch.codePointAt(0)) >>> 0;
+      return COLORS[h % (COLORS.length - 1)];
+    }
+    function avatarFor(name) {
       const el = document.createElement('div');
       el.className = 'avatar';
-      el.style.background = AVATAR_COLORS[h % AVATAR_COLORS.length];
+      el.style.background = colorFor(name);
       el.textContent = (name[0] || '?').toUpperCase();
       return el;
     }
 
+    // Los extras los escribe CUALQUIER cliente: se validan antes de usarlos.
+    // Misma regla que el coordinador (isYellow en coordinator/index.js):
+    // tono 40°-70°, saturado, ni muy oscuro ni casi blanco
+    function isYellow(hex) {
+      const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
+      if (!m) return false;
+      const [r, g, b] = m.slice(1).map((h) => parseInt(h, 16) / 255);
+      const max = Math.max(r, g, b), min = Math.min(r, g, b);
+      const l = (max + min) / 2;
+      if (max === min) return false;
+      const d = max - min;
+      const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+      let h;
+      if (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) * 60;
+      else if (max === g) h = ((b - r) / d + 2) * 60;
+      else h = ((r - g) / d + 4) * 60;
+      return h >= 40 && h <= 70 && s >= 0.5 && l >= 0.3 && l <= 0.85;
+    }
+
+    // Color con el que se dibuja un auto. El taxi siempre es amarillo y el
+    // Uber nunca, aunque los extras digan otra cosa (los escribe el cliente).
+    function carColor(p) {
+      if (p.vehicle !== 'uber') return VEHICLE_COLORS.taxi;
+      const c = safeColor((p.extras || {}).color);
+      return c && !isYellow(c) ? c : VEHICLE_COLORS.uber;
+    }
+
+    function safeColor(c) {
+      return typeof c === 'string' && /^#[0-9a-fA-F]{6}$/.test(c) ? c : null;
+    }
+    function safeMood(m) {
+      return typeof m === 'string' ? Array.from(m).slice(0, 2).join('') : '';
+    }
+
+    // ---------- Lista de jugadores (players_update) ----------
     function renderPlayers(players) {
       const ul = document.getElementById('players');
       ul.innerHTML = '';
@@ -74,10 +147,15 @@
         sub.className = 'sub';
         const dot = document.createElement('span');
         dot.className = 'dot';
-        sub.append(dot, 'En línea');
+        sub.append(dot, `${VEHICLE_LABELS[p.vehicle] || VEHICLE_LABELS.taxi} · ${p.provider === 'google' ? 'Google' : 'Usuario y contraseña'}`);
         text.append(name, sub);
-        li.append(avatarFor(p.username), text);
-        if (p.username === username) {
+        // El puntaje se completa con cada 'state' (ver updateScores)
+        const score = document.createElement('span');
+        score.className = 'score';
+        score.title = 'Pasajeros recogidos';
+        li.dataset.userId = String(p.userId);
+        li.append(avatarFor(p.username), text, score);
+        if (String(p.userId) === myUserId) {
           li.classList.add('is-me');
           const me = document.createElement('span');
           me.className = 'me';
@@ -88,6 +166,444 @@
       }
       document.getElementById('count').textContent = players.length;
       document.getElementById('empty').classList.toggle('hidden', players.length > 0);
+      if (lastState) updateScores(lastState.players);
+    }
+
+    function updateScores(players) {
+      for (const p of players) {
+        const el = document.querySelector(`#players li[data-user-id="${CSS.escape(String(p.userId))}"] .score`);
+        const text = `🙋 ${p.score || 0}`;
+        if (el && el.textContent !== text) el.textContent = text;
+      }
+    }
+
+    // ---------- Canvas ----------
+    const canvas = document.getElementById('world');
+    const ctx = canvas.getContext('2d');
+
+    // La ciudad no cambia durante la partida: se dibuja una vez (al recibir
+    // 'welcome') en un canvas aparte y en cada frame solo se copia.
+    let cityLayer = null;
+    // Tejas: [faldón iluminado, faldón en sombra]
+    const ROOFS = [['#c0583f', '#93402d'], ['#a8473a', '#7d3229'], ['#8a6a52', '#665040'], ['#5d6b80', '#45505f'], ['#b07a45', '#865a31']];
+
+    // Casa vista desde arriba: techo a dos aguas partido por la cumbrera
+    function drawHouse(c, h) {
+      const [lit, dark] = ROOFS[h.roof % ROOFS.length];
+      c.fillStyle = 'rgba(0, 0, 0, .35)';
+      c.fillRect(h.x + 3, h.y + 3, h.w, h.h);
+      if (h.ridge === 'h') {
+        c.fillStyle = lit; c.fillRect(h.x, h.y, h.w, h.h / 2);
+        c.fillStyle = dark; c.fillRect(h.x, h.y + h.h / 2, h.w, h.h / 2);
+      } else {
+        c.fillStyle = lit; c.fillRect(h.x, h.y, h.w / 2, h.h);
+        c.fillStyle = dark; c.fillRect(h.x + h.w / 2, h.y, h.w / 2, h.h);
+      }
+      // Cumbrera y borde del techo
+      c.strokeStyle = 'rgba(255, 235, 210, .35)';
+      c.lineWidth = 1.5;
+      c.beginPath();
+      if (h.ridge === 'h') { c.moveTo(h.x + 2, h.y + h.h / 2); c.lineTo(h.x + h.w - 2, h.y + h.h / 2); }
+      else { c.moveTo(h.x + h.w / 2, h.y + 2); c.lineTo(h.x + h.w / 2, h.y + h.h - 2); }
+      c.stroke();
+      c.strokeStyle = 'rgba(0, 0, 0, .55)';
+      c.lineWidth = 1;
+      c.strokeRect(h.x + 0.5, h.y + 0.5, h.w - 1, h.h - 1);
+      if (h.chimney) {
+        c.fillStyle = '#5b4a42';
+        c.fillRect(h.x + h.w * 0.7, h.y + h.h * 0.18, 5, 5);
+      }
+    }
+
+    function drawBuilding(c, b) {
+      c.fillStyle = 'rgba(0, 0, 0, .4)';
+      c.fillRect(b.x + 4, b.y + 4, b.w, b.h);
+      c.fillStyle = '#4a5266';
+      c.fillRect(b.x, b.y, b.w, b.h);
+      c.strokeStyle = '#2b3140';
+      c.lineWidth = 3;
+      c.strokeRect(b.x + 1.5, b.y + 1.5, b.w - 3, b.h - 3);
+      // Azotea: equipos de aire acondicionado y helipuerto
+      c.fillStyle = '#6b7488';
+      for (let k = 0; k < b.units; k++) c.fillRect(b.x + 8 + k * 14, b.y + 8, 10, 8);
+      const cx = b.x + b.w * 0.62, cy = b.y + b.h * 0.62, r = Math.min(b.w, b.h) * 0.2;
+      c.strokeStyle = '#ffc928';
+      c.lineWidth = 2;
+      c.beginPath(); c.arc(cx, cy, r, 0, Math.PI * 2); c.stroke();
+      c.fillStyle = '#ffc928';
+      c.font = `bold ${Math.round(r)}px "Russo One", sans-serif`;
+      c.textAlign = 'center';
+      c.textBaseline = 'middle';
+      c.fillText('H', cx, cy + 1);
+    }
+
+    function drawPark(c, b) {
+      const s = world.sidewalk;
+      const x = b.x + s, y = b.y + s, w = b.size - 2 * s;
+      // Senderos en cruz y fuente
+      c.fillStyle = '#c8b48a';
+      c.fillRect(x + w / 2 - 4, y, 8, w);
+      c.fillRect(x, y + w / 2 - 4, w, 8);
+      c.fillStyle = '#c8b48a';
+      c.beginPath(); c.arc(x + w / 2, y + w / 2, 14, 0, Math.PI * 2); c.fill();
+      c.fillStyle = '#4aa3d8';
+      c.beginPath(); c.arc(x + w / 2, y + w / 2, 9, 0, Math.PI * 2); c.fill();
+      for (const t of b.trees) {
+        c.fillStyle = 'rgba(0, 0, 0, .3)';
+        c.beginPath(); c.arc(t.x + 2, t.y + 2, t.r, 0, Math.PI * 2); c.fill();
+        c.fillStyle = '#2f7d45';
+        c.beginPath(); c.arc(t.x, t.y, t.r, 0, Math.PI * 2); c.fill();
+        c.fillStyle = '#3f9c58';
+        c.beginPath(); c.arc(t.x - t.r * 0.3, t.y - t.r * 0.3, t.r * 0.5, 0, Math.PI * 2); c.fill();
+      }
+    }
+
+    function buildCityLayer() {
+      cityLayer = document.createElement('canvas');
+      cityLayer.width = world.width;
+      cityLayer.height = world.height;
+      const c = cityLayer.getContext('2d');
+      // Asfalto: todo lo que no es manzana es calle
+      c.fillStyle = '#2a2d35';
+      c.fillRect(0, 0, world.width, world.height);
+
+      const cell = world.cell;
+      const m = world.blocks.length ? world.blocks[0].x : 0; // ancho de la franja de calle por lado
+      // Línea amarilla discontinua en el centro de cada calle
+      c.strokeStyle = 'rgba(255, 201, 40, .7)';
+      c.lineWidth = 2;
+      c.setLineDash([12, 10]);
+      c.beginPath();
+      for (let x = cell; x < world.width; x += cell) { c.moveTo(x, 0); c.lineTo(x, world.height); }
+      for (let y = cell; y < world.height; y += cell) { c.moveTo(0, y); c.lineTo(world.width, y); }
+      c.stroke();
+      c.setLineDash([]);
+
+      if (m) {
+        // Cruces: el centro va sin línea y cada entrada lleva paso de cebra
+        for (let ix = cell; ix < world.width; ix += cell) {
+          for (let iy = cell; iy < world.height; iy += cell) {
+            c.fillStyle = '#2a2d35';
+            c.fillRect(ix - m, iy - m, 2 * m, 2 * m);
+            c.fillStyle = 'rgba(240, 240, 240, .75)';
+            for (let k = -m + 4; k < m - 4; k += 9) {
+              c.fillRect(ix + k, iy - m - 12, 5, 9);   // norte
+              c.fillRect(ix + k, iy + m + 3, 5, 9);    // sur
+              c.fillRect(ix - m - 12, iy + k, 9, 5);   // oeste
+              c.fillRect(ix + m + 3, iy + k, 9, 5);    // este
+            }
+          }
+        }
+      }
+
+      for (const b of world.blocks) {
+        // Andén (gris claro con bordillo) y lote interior
+        c.fillStyle = '#9a9ca3';
+        c.beginPath(); c.roundRect(b.x, b.y, b.size, b.size, 8); c.fill();
+        c.strokeStyle = '#6d7078';
+        c.lineWidth = 2;
+        c.stroke();
+        const s = world.sidewalk;
+        c.fillStyle = b.type === 'edificio' ? '#7c7f87' : '#3e6b3f';
+        c.fillRect(b.x + s, b.y + s, b.size - 2 * s, b.size - 2 * s);
+        if (b.houses) for (const h of b.houses) drawHouse(c, h);
+        if (b.building) drawBuilding(c, b.building);
+        if (b.trees) drawPark(c, b);
+      }
+    }
+
+    function drawBackground() {
+      if (!cityLayer) buildCityLayer();
+      ctx.drawImage(cityLayer, 0, 0);
+    }
+
+    // Auto visto desde arriba. El servidor lo trata como un círculo de radio r
+    // (colisiones); el dibujo cabe dentro de ese círculo. angle = 0 mira a la derecha.
+    // vehicle decide el letrero del techo: "TAXI" iluminado o la "U" de Uber.
+    function drawCar(x, y, angle, color, vehicle) {
+      const r = world.playerRadius;
+      const L = r * 1.9, W = r * 1.05;
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(angle);
+      // Sombra
+      ctx.fillStyle = 'rgba(0, 0, 0, .4)';
+      ctx.beginPath(); ctx.roundRect(-L / 2 + 3, -W / 2 + 3, L, W, 6); ctx.fill();
+      // Ruedas
+      ctx.fillStyle = '#0a0a0a';
+      for (const wx of [-L * 0.28, L * 0.28]) {
+        for (const wy of [-W / 2 - 1.5, W / 2 - 2.5]) ctx.fillRect(wx - 4.5, wy, 9, 4);
+      }
+      // Carrocería
+      ctx.fillStyle = color;
+      ctx.beginPath(); ctx.roundRect(-L / 2, -W / 2, L, W, 6); ctx.fill();
+      ctx.lineWidth = 2; ctx.strokeStyle = '#0a0a0a'; ctx.stroke();
+      // Parabrisas (adelante) y luneta (atrás)
+      ctx.fillStyle = 'rgba(15, 22, 34, .85)';
+      ctx.beginPath(); ctx.roundRect(L * 0.06, -W / 2 + 3, L * 0.18, W - 6, 3); ctx.fill();
+      ctx.beginPath(); ctx.roundRect(-L * 0.34, -W / 2 + 3, L * 0.12, W - 6, 3); ctx.fill();
+      // Techo
+      ctx.fillStyle = 'rgba(255, 255, 255, .18)';
+      ctx.fillRect(-L * 0.2, -W / 2 + 4, L * 0.24, W - 8);
+      if (vehicle === 'taxi') {
+        // Franja de cuadros a los lados y letrero TAXI sobre el techo
+        for (let k = 0; k < 6; k++) {
+          ctx.fillStyle = k % 2 ? '#f4f5f7' : '#0a0a0a';
+          ctx.fillRect(-L * 0.3 + k * 4, -W / 2, 4, 2);
+          ctx.fillRect(-L * 0.3 + k * 4, W / 2 - 2, 4, 2);
+        }
+        ctx.fillStyle = '#0a0a0a';
+        ctx.fillRect(-L * 0.14, -W * 0.3, 8, W * 0.6);
+        ctx.save();
+        ctx.rotate(Math.PI / 2);
+        ctx.fillStyle = '#ffc928';
+        ctx.font = 'bold 5px Arial, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('TAXI', 0, L * 0.14 - 4);
+        ctx.restore();
+      } else {
+        // Letrero de Uber: placa negra con la U
+        ctx.fillStyle = '#0a0a0a';
+        ctx.beginPath(); ctx.roundRect(-L * 0.15, -5, 10, 10, 2); ctx.fill();
+        ctx.strokeStyle = '#f4f5f7'; ctx.lineWidth = 1; ctx.stroke();
+        ctx.save();
+        ctx.translate(-L * 0.15 + 5, 0);
+        ctx.rotate(Math.PI / 2);
+        ctx.fillStyle = '#f4f5f7';
+        ctx.font = 'bold 8px Arial, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('U', 0, 0.5);
+        ctx.restore();
+      }
+      // Faros y luces traseras
+      ctx.fillStyle = '#fff6b0';
+      ctx.fillRect(L / 2 - 3, -W * 0.38, 3, 4); ctx.fillRect(L / 2 - 3, W * 0.38 - 4, 3, 4);
+      ctx.fillStyle = '#ff3b3b';
+      ctx.fillRect(-L / 2, -W * 0.38, 2.5, 4); ctx.fillRect(-L / 2, W * 0.38 - 4, 2.5, 4);
+      ctx.restore();
+    }
+
+    function drawPlayer(p, x, y, angle) {
+      const r = world.playerRadius;
+      const isMe = String(p.userId) === myUserId;
+      const extras = p.extras || {};
+      const color = carColor(p);
+
+      if (isMe) {
+        ctx.beginPath();
+        ctx.arc(x, y, r + 6, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(255, 255, 255, .85)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+      drawCar(x, y, angle, color, p.vehicle);
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+
+      // Badge del provider (viene del JWT validado por el servidor, no de extras)
+      const bx = x + r * 0.75, by = y - r * 0.75;
+      ctx.beginPath();
+      ctx.arc(bx, by, 8, 0, Math.PI * 2);
+      ctx.fillStyle = p.provider === 'google' ? '#ffffff' : '#2a2d36';
+      ctx.fill();
+      ctx.font = 'bold 10px Inter, sans-serif';
+      ctx.fillStyle = p.provider === 'google' ? '#4285f4' : '#ffc928';
+      ctx.fillText(p.provider === 'google' ? 'G' : '🔑', bx, by + 1);
+
+      // Nombre + mood. fillText dibuja texto plano: no hay riesgo de XSS.
+      const mood = safeMood(extras.mood);
+      const label = `${p.username}${mood ? ` ${mood}` : ''} · ${p.score || 0}`;
+      ctx.font = '600 13px Inter, sans-serif';
+      ctx.textBaseline = 'bottom';
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = 'rgba(0, 0, 0, .75)';
+      ctx.strokeText(label, x, y - r - 6);
+      ctx.fillStyle = isMe ? '#ffc928' : '#f4f5f7';
+      ctx.fillText(label, x, y - r - 6);
+    }
+
+    // Pasajero: punto de referencia al que hay que llegar. Su posición la
+    // decide el servidor y llega en cada 'state'.
+    function drawPassenger({ x, y }) {
+      const pr = world.passengerRadius;
+      const pulse = (performance.now() / 900) % 1;
+      ctx.beginPath();
+      ctx.arc(x, y, pr + 6 + pulse * 18, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(255, 201, 40, ${0.8 * (1 - pulse)})`;
+      ctx.lineWidth = 3;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(x, y, pr + 4, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(255, 201, 40, .25)';
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#ffc928';
+      ctx.stroke();
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = `${pr * 2}px sans-serif`;
+      ctx.fillText('🙋', x, y + 1);
+    }
+
+    // Flecha junto a MI auto que apunta al pasajero (para encontrarlo rápido)
+    function drawGuide(x, y, target) {
+      const dist = Math.hypot(target.x - x, target.y - y);
+      if (dist < world.playerRadius * 4) return;
+      const a = Math.atan2(target.y - y, target.x - x);
+      const d = world.playerRadius + 18;
+      ctx.save();
+      ctx.translate(x + Math.cos(a) * d, y + Math.sin(a) * d);
+      ctx.rotate(a);
+      ctx.beginPath();
+      ctx.moveTo(9, 0); ctx.lineTo(-6, -7); ctx.lineTo(-2, 0); ctx.lineTo(-6, 7);
+      ctx.closePath();
+      ctx.fillStyle = '#ffc928';
+      ctx.fill();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = '#0a0a0a';
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // Marcador por equipo (lo lleva el servidor en 'state'.teams)
+    function drawTeams(teams) {
+      ctx.textBaseline = 'middle';
+      ctx.font = '15px "Russo One", sans-serif';
+      const parts = [['UBER', teams.uber, '#2ee6a6'], ['TAXI', teams.taxi, '#ffc928']];
+      const text = (label, n) => `${label} ${n}`;
+      const w = parts.reduce((s, [l, n]) => s + ctx.measureText(text(l, n)).width, 0) + 52;
+      const x = canvas.width - w - 10, y = canvas.height - 22;
+      ctx.fillStyle = 'rgba(8, 9, 12, .82)';
+      ctx.beginPath(); ctx.roundRect(x, y - 15, w, 30, 15); ctx.fill();
+      let cx = x + 14;
+      ctx.textAlign = 'left';
+      parts.forEach(([label, n, color], i) => {
+        if (i) { ctx.fillStyle = '#9aa1b2'; ctx.fillText('·', cx, y + 1); cx += 14; }
+        ctx.fillStyle = color;
+        ctx.fillText(text(label, n), cx, y + 1);
+        cx += ctx.measureText(text(label, n)).width + 10;
+      });
+    }
+
+    function drawToast() {
+      if (!toast || performance.now() > toast.until) return;
+      ctx.font = '700 16px Inter, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      const w = ctx.measureText(toast.text).width + 28;
+      const x = canvas.width / 2, y = 26;
+      ctx.fillStyle = 'rgba(8, 9, 12, .85)';
+      ctx.beginPath(); ctx.roundRect(x - w / 2, y - 16, w, 32, 16); ctx.fill();
+      ctx.lineWidth = 1.5; ctx.strokeStyle = toast.mine ? '#ffc928' : 'rgba(255, 255, 255, .25)'; ctx.stroke();
+      ctx.fillStyle = toast.mine ? '#ffc928' : '#f4f5f7';
+      ctx.fillText(toast.text, x, y + 1);
+    }
+
+    // Ángulo intermedio por el camino más corto (de 170° a -170° gira 20°, no 340°)
+    function lerpAngle(a, b, t) {
+      let d = b - a;
+      while (d > Math.PI) d -= Math.PI * 2;
+      while (d < -Math.PI) d += Math.PI * 2;
+      return a + d * t;
+    }
+
+    function render() {
+      requestAnimationFrame(render);
+      if (!world) return;
+      drawBackground();
+      if (!lastState) return;
+      if (lastState.passenger) drawPassenger(lastState.passenger);
+      // Interpolación de dibujo: avanza de prevState a lastState durante un tick.
+      const alpha = Math.min((performance.now() - lastStateAt) / (1000 / world.tickRate), 1);
+      const prev = new Map(prevState ? prevState.players.map((p) => [p.userId, p]) : []);
+      for (const p of lastState.players) {
+        const a = prev.get(p.userId) || p;
+        const x = a.x + (p.x - a.x) * alpha;
+        const y = a.y + (p.y - a.y) * alpha;
+        drawPlayer(p, x, y, lerpAngle(a.angle || 0, p.angle || 0, alpha));
+        if (String(p.userId) === myUserId && lastState.passenger) drawGuide(x, y, lastState.passenger);
+      }
+      if (lastState.teams) drawTeams(lastState.teams);
+      drawToast();
+    }
+    requestAnimationFrame(render);
+
+    // ---------- Controles del feature extra ----------
+    const EXTRAS_KEY = `extras:${username}`;
+    let myExtras = {};
+    try { myExtras = JSON.parse(localStorage.getItem(EXTRAS_KEY)) || {}; } catch (_) {}
+
+    // Colores según el bando (se arma al recibir 'welcome', que trae el vehicle
+    // del JWT). El coordinador aplica la misma regla: esto solo evita ofrecer
+    // opciones que el servidor va a descartar.
+    // - taxi: sin selector, todos los taxis son amarillos
+    // - uber: sin amarillos, ni en las muestras ni en el selector libre
+    function buildColorControls(vehicle, sendExtras) {
+      const swatches = document.getElementById('swatches');
+      const hint = document.getElementById('color-hint');
+      swatches.innerHTML = '';
+      if (vehicle === 'taxi') {
+        hint.textContent = '🚕 Todos los taxis son amarillos: el color no se puede cambiar.';
+        return;
+      }
+      hint.textContent = '🚘 Elige el color de tu Uber (el amarillo es de los taxis).';
+      // Sin color propio: el Uber vuelve a su negro
+      const original = document.createElement('button');
+      original.type = 'button';
+      original.className = 'swatch swatch-original';
+      original.style.background = VEHICLE_COLORS.uber;
+      original.title = 'Negro Uber';
+      original.textContent = '↺';
+      original.addEventListener('click', () => sendExtras({ color: '' }));
+      swatches.append(original);
+      for (const c of COLORS.filter((c) => !isYellow(c))) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'swatch';
+        b.style.background = c;
+        b.title = c;
+        b.addEventListener('click', () => sendExtras({ color: c }));
+        swatches.append(b);
+      }
+      const picker = document.createElement('input');
+      picker.type = 'color';
+      picker.className = 'swatch-picker';
+      picker.title = 'Otro color (no amarillo)';
+      picker.addEventListener('input', () => {
+        if (isYellow(picker.value)) {
+          hint.textContent = '🚫 El amarillo es de los taxis: elige otro color.';
+          return;
+        }
+        hint.textContent = '🚘 Elige el color de tu Uber (el amarillo es de los taxis).';
+        sendExtras({ color: picker.value });
+      });
+      swatches.append(picker);
+      markSelected();
+    }
+
+    function buildControls(sendExtras) {
+      const moods = document.getElementById('moods');
+      for (const m of MOODS) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'mood';
+        b.dataset.mood = m;
+        b.textContent = m || '∅';
+        b.title = m ? `Mood ${m}` : 'Sin mood';
+        b.addEventListener('click', () => sendExtras({ mood: m }));
+        moods.append(b);
+      }
+    }
+
+    function markSelected() {
+      for (const b of document.querySelectorAll('.swatch')) {
+        b.classList.toggle('selected', b.classList.contains('swatch-original') ? !myExtras.color : b.title === myExtras.color);
+      }
+      for (const b of document.querySelectorAll('.mood')) {
+        b.classList.toggle('selected', b.dataset.mood === (myExtras.mood || ''));
+      }
     }
 
     // Si el navegador restaura esta página desde su caché de historial (bfcache)
@@ -100,28 +616,159 @@
       window.location.href = 'login.html';
     } else {
       document.getElementById('me').textContent = username;
-      document.getElementById('my-avatar').replaceWith(avatarFor(username));
+      const initialAvatar = avatarFor(username);
+      initialAvatar.id = 'my-avatar';
+      document.getElementById('my-avatar').replaceWith(initialAvatar);
 
       let loggingOut = false;
-      // encodeURIComponent: si el token se "ensucia" con caracteres como # o espacios,
-      // new WebSocket() lanzaría error en vez de dejar que el coordinador lo rechace.
-      const ws = new WebSocket(`${COORDINATOR_WS}/connect?token=${encodeURIComponent(token)}`);
+      // Token con el que está abierto el WebSocket actual
+      let currentToken = token;
+      let ws = null;
 
-      ws.onopen = () => {
-        const status = document.getElementById('status');
-        status.textContent = 'En línea';
-        status.classList.add('online');
+      function send(obj) {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+      }
+
+      // extras_update manda el objeto completo: el servidor reemplaza player.extras
+      function sendExtras(patch) {
+        myExtras = { ...myExtras, ...patch };
+        if (!myExtras.mood) delete myExtras.mood;
+        if (!myExtras.color) delete myExtras.color;
+        try { localStorage.setItem(EXTRAS_KEY, JSON.stringify(myExtras)); } catch (_) {}
+        send({ type: 'extras_update', extras: myExtras });
+        markSelected();
+      }
+      buildControls(sendExtras);
+      markSelected();
+
+      // ---------- Input: el cliente solo manda INTENCIONES ----------
+      const KEYMAP = {
+        ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down',
+        ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right',
       };
+      const pressed = new Set();
+      let lastDir = { x: 0, y: 0 };
 
-      ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'players_update') {
-          renderPlayers(msg.players);
-        }
-      };
+      function sendIntentIfChanged() {
+        const dir = {
+          x: (pressed.has('right') ? 1 : 0) - (pressed.has('left') ? 1 : 0),
+          y: (pressed.has('down') ? 1 : 0) - (pressed.has('up') ? 1 : 0),
+        };
+        // Solo cuando cambia la dirección: mantener una tecla no genera tráfico
+        if (dir.x === lastDir.x && dir.y === lastDir.y) return;
+        lastDir = dir;
+        send({ type: 'intent', intent: { dir } });
+      }
 
-      ws.onclose = (event) => {
+      window.addEventListener('keydown', (e) => {
+        const k = KEYMAP[e.code];
+        if (!k || e.target.tagName === 'INPUT') return;
+        e.preventDefault(); // que las flechas no hagan scroll
+        pressed.add(k);
+        sendIntentIfChanged();
+      });
+      window.addEventListener('keyup', (e) => {
+        const k = KEYMAP[e.code];
+        if (!k) return;
+        pressed.delete(k);
+        sendIntentIfChanged();
+      });
+      // Si la pestaña pierde el foco no llega el keyup: frenar al jugador
+      window.addEventListener('blur', () => {
+        pressed.clear();
+        sendIntentIfChanged();
+      });
+
+      function connect() {
+        // encodeURIComponent: si el token se "ensucia" con caracteres como # o espacios,
+        // new WebSocket() lanzaría error en vez de dejar que el coordinador lo rechace.
+        const sock = new WebSocket(`${COORDINATOR_WS}/connect?token=${encodeURIComponent(currentToken)}`);
+        ws = sock;
+
+        sock.onopen = () => {
+          const status = document.getElementById('status');
+          status.textContent = 'En línea';
+          status.classList.add('online');
+        };
+
+        sock.onmessage = (event) => {
+          if (sock !== ws) return;
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'welcome') {
+            world = msg.world;
+            cityLayer = null; // se vuelve a dibujar con el mapa recibido
+            myUserId = String(msg.you.userId);
+            canvas.width = world.width;
+            canvas.height = world.height;
+            // El nombre viene del JWT validado: si el token cambió de usuario, se actualiza
+            document.getElementById('me').textContent = msg.you.username;
+            const avatar = avatarFor(msg.you.username);
+            avatar.id = 'my-avatar';
+            document.getElementById('my-avatar').replaceWith(avatar);
+            // Un color guardado antes que el bando no permite (taxi, o amarillo en
+            // un Uber) se descarta; luego se arma el selector de ese bando.
+            if (myExtras.color && (msg.you.vehicle !== 'uber' || isYellow(myExtras.color))) {
+              delete myExtras.color;
+              try { localStorage.setItem(EXTRAS_KEY, JSON.stringify(myExtras)); } catch (_) {}
+            }
+            buildColorControls(msg.you.vehicle, sendExtras);
+            // Restaurar el color/mood elegidos antes (si recargó la página o reconectó)
+            if (Object.keys(myExtras).length) send({ type: 'extras_update', extras: myExtras });
+            // Tras reconectar el servidor arranca con intent quieto: reenviar la dirección actual
+            lastDir = { x: 0, y: 0 };
+            sendIntentIfChanged();
+          } else if (msg.type === 'state') {
+            prevState = lastState;
+            lastState = msg;
+            lastStateAt = performance.now();
+            updateScores(msg.players);
+          } else if (msg.type === 'players_update') {
+            renderPlayers(msg.players);
+          } else if (msg.type === 'pickup') {
+            const mine = String(msg.userId) === myUserId;
+            toast = {
+              text: mine
+                ? `¡Recogiste al pasajero! Llevas ${msg.score}`
+                : `${msg.username} (${msg.vehicle === 'uber' ? 'Uber' : 'Taxi'}) recogió al pasajero`,
+              mine,
+              until: performance.now() + 2500,
+            };
+          }
+        };
+
+        sock.onclose = (event) => onSocketClose(sock, event);
+      }
+
+      // Chequeo periódico del token: si cambia en localStorage (DevTools, otra
+      // pestaña, nuevo login) se reconecta con el nuevo SIN recargar la página,
+      // y el coordinador lo vuelve a validar en el upgrade. Si es inválido o
+      // está vencido, el cierre 4001 lleva al login como siempre.
+      const TOKEN_CHECK_MS = 1000;
+      setInterval(() => {
         if (loggingOut) return;
+        let stored = null;
+        try { stored = localStorage.getItem('token'); } catch (_) {}
+        if (stored === currentToken) return;
+        if (!stored) {
+          // Token borrado: equivale a cerrar sesión
+          loggingOut = true;
+          ws.close(1000, 'token removed');
+          alert('Sesión terminada: el token fue eliminado.');
+          window.location.href = 'login.html';
+          return;
+        }
+        console.log('[lobby] el token cambió: reconectando con el nuevo');
+        currentToken = stored;
+        const old = ws;
+        connect(); // ws ya apunta al socket nuevo: el cierre del viejo se ignora
+        old.close(1000, 'token changed');
+      }, TOKEN_CHECK_MS);
+
+      function onSocketClose(sock, event) {
+        // Cierre de un socket ya reemplazado por un cambio de token
+        if (sock !== ws) return;
+        if (loggingOut) return;
+        loggingOut = true; // que el chequeo del token no actúe mientras se redirige
         // 4002: la sesión se abrió en otra pestaña. localStorage se comparte entre
         // pestañas, así que NO se borra el token: lo está usando la otra.
         if (event.code === 4002) {
@@ -130,8 +777,8 @@
           return;
         }
         if (event.code === 4001) {
-          alert(event.reason === 'token expired'
-            ? 'Sesión terminada: tu token venció.'
+          alert(event.reason === 'token expired' ? 'Sesión terminada: tu token venció.'
+            : event.reason === 'session expired' ? 'Sesión terminada: se superó la duración máxima de la sesión.'
             : 'Sesión terminada: token inválido.');
         } else {
           alert('Sesión terminada: se perdió la conexión con el coordinador.');
@@ -139,7 +786,9 @@
         localStorage.removeItem('token');
         localStorage.removeItem('username');
         window.location.href = 'login.html';
-      };
+      }
+
+      connect();
 
       document.getElementById('logout').addEventListener('click', () => {
         loggingOut = true;

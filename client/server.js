@@ -1,4 +1,6 @@
-require('dotenv').config();
+const dotenv = require('dotenv');
+dotenv.config();
+const fs = require('fs');
 const express = require('express');
 const path = require('path');
 
@@ -8,6 +10,27 @@ const COORDINATOR_WS = process.env.COORDINATOR_WS || 'ws://localhost:5000';
 // URLs públicas (ngrok). Si faltan, se usan las locales.
 const PUBLIC_AUTH_URL = process.env.PUBLIC_AUTH_URL || AUTH_URL;
 const PUBLIC_COORDINATOR_WS = process.env.PUBLIC_COORDINATOR_WS || COORDINATOR_WS;
+// Client ID de OAuth: es público (va en el botón de Google), el mismo que usa auth-service.
+// Si el .env viene del Taller 1 (sin GOOGLE_CLIENT_ID) se toma el del .env.example.
+function loadGoogleClientId() {
+  try {
+    const env = dotenv.parse(fs.readFileSync(path.join(__dirname, '.env')));
+    const fromDotenv = (env.GOOGLE_CLIENT_ID || '').trim();
+    if (fromDotenv && !fromDotenv.startsWith('TU-CLIENT-ID')) return fromDotenv;
+  } catch (_) {}
+  const fromEnv = (process.env.GOOGLE_CLIENT_ID || '').trim();
+  if (fromEnv && !fromEnv.startsWith('TU-CLIENT-ID')) return fromEnv;
+  try {
+    return (dotenv.parse(fs.readFileSync(path.join(__dirname, '.env.example'))).GOOGLE_CLIENT_ID || '').trim();
+  } catch (_) {
+    return fromEnv;
+  }
+}
+const GOOGLE_CLIENT_ID = loadGoogleClientId();
+
+if (!GOOGLE_CLIENT_ID) {
+  console.warn('Aviso: falta GOOGLE_CLIENT_ID en el .env; el botón de Google no se mostrará');
+}
 
 const app = express();
 
@@ -20,15 +43,16 @@ function isLocal(req) {
 // Si el cliente se abre por localhost usa los servicios locales; si se abre por
 // el túnel de ngrok usa las URLs públicas (https:// y wss://).
 app.get('/config.js', (req, res) => {
+  const googleClientId = loadGoogleClientId();
   const config = isLocal(req)
-    ? { AUTH_URL, COORDINATOR_WS }
-    : { AUTH_URL: PUBLIC_AUTH_URL, COORDINATOR_WS: PUBLIC_COORDINATOR_WS };
+    ? { AUTH_URL, COORDINATOR_WS, GOOGLE_CLIENT_ID: googleClientId }
+    : { AUTH_URL: PUBLIC_AUTH_URL, COORDINATOR_WS: PUBLIC_COORDINATOR_WS, GOOGLE_CLIENT_ID: googleClientId };
   res.type('application/javascript');
   res.set('Cache-Control', 'no-store');
   res.send(`window.APP_CONFIG = ${JSON.stringify(config)};`);
 });
 
-// Dos páginas: login.html (login + registro) y lobby.html
+// Dos páginas: login.html (login, registro y Google) y lobby.html (lobby + juego)
 app.get('/', (req, res) => res.redirect('/login.html'));
 app.use(express.static(path.join(__dirname, 'public')));
 
