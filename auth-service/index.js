@@ -22,7 +22,17 @@ function parseExpiresIn(raw) {
 }
 let JWT_EXPIRES_IN = parseExpiresIn(process.env.JWT_EXPIRES_IN);
 const BCRYPT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '10', 10);
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+// Si el .env viene del Taller 1 (sin GOOGLE_CLIENT_ID) se toma el del .env.example
+function loadGoogleClientId() {
+  const fromEnv = (process.env.GOOGLE_CLIENT_ID || '').trim();
+  if (fromEnv && !fromEnv.startsWith('TU-CLIENT-ID')) return fromEnv;
+  try {
+    return (dotenv.parse(fs.readFileSync(path.join(__dirname, '.env.example'))).GOOGLE_CLIENT_ID || '').trim();
+  } catch (_) {
+    return fromEnv;
+  }
+}
+const GOOGLE_CLIENT_ID = loadGoogleClientId();
 const DB_FILE = process.env.DB_FILE || 'users.db';
 
 if (!JWT_SECRET || JWT_SECRET.length < 32) {

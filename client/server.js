@@ -1,4 +1,6 @@
-require('dotenv').config();
+const dotenv = require('dotenv');
+dotenv.config();
+const fs = require('fs');
 const express = require('express');
 const path = require('path');
 
@@ -9,7 +11,17 @@ const COORDINATOR_WS = process.env.COORDINATOR_WS || 'ws://localhost:5000';
 const PUBLIC_AUTH_URL = process.env.PUBLIC_AUTH_URL || AUTH_URL;
 const PUBLIC_COORDINATOR_WS = process.env.PUBLIC_COORDINATOR_WS || COORDINATOR_WS;
 // Client ID de OAuth: es público (va en el botón de Google), el mismo que usa auth-service.
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+// Si el .env viene del Taller 1 (sin GOOGLE_CLIENT_ID) se toma el del .env.example.
+function loadGoogleClientId() {
+  const fromEnv = (process.env.GOOGLE_CLIENT_ID || '').trim();
+  if (fromEnv && !fromEnv.startsWith('TU-CLIENT-ID')) return fromEnv;
+  try {
+    return (dotenv.parse(fs.readFileSync(path.join(__dirname, '.env.example'))).GOOGLE_CLIENT_ID || '').trim();
+  } catch (_) {
+    return fromEnv;
+  }
+}
+const GOOGLE_CLIENT_ID = loadGoogleClientId();
 
 if (!GOOGLE_CLIENT_ID) {
   console.warn('Aviso: falta GOOGLE_CLIENT_ID en el .env; el botón de Google no se mostrará');
