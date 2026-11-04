@@ -379,8 +379,105 @@ app.get('/token-policy', (req, res) => {
   res.json({ expiresInSeconds: probe.exp - probe.iat });
 });
 
+// ===================== Directorio de coordinadores =====================
+// El auth también es el "directory service" del mesh:
+// - los coordinadores se anuncian cada 2 s con POST /heartbeat;
+// - los clientes preguntan a cuál conectarse con GET /coordinator;
+// - los coordinadores descubren a sus pares con GET /peers.
+// Vive en memoria: si el auth se reinicia, los coordinadores se vuelven a
+// anunciar en su siguiente heartbeat (2 s).
+const DIRECTORY_TTL_MS = parseInt(process.env.DIRECTORY_TTL_MS || '6000', 10); // 3 ciclos de 2 s
+const COORD_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const WS_URL_RE = /^wss?:\/\/[^\s]{1,250}$/;
+
+// coordinatorId -> { coordinatorId, publicUrl, peerUrl, connectedPlayers, uptime, lastSeen, assigned }
+const coordinators = new Map();
+
+function aliveCoordinators(now = Date.now()) {
+  const alive = [];
+  for (const [id, c] of coordinators) {
+    if (now - c.lastSeen > DIRECTORY_TTL_MS) {
+      coordinators.delete(id); // más de 6 s sin heartbeat: muerto
+      console.log(`[directorio] ${id} sin heartbeat hace ${now - c.lastSeen} ms: descartado`);
+    } else {
+      alive.push(c);
+    }
+  }
+  return alive;
+}
+
+// /heartbeat y /peers solo los usan coordinadores: exigen un token firmado con
+// la JWT_SECRET compartida y { role: 'coordinator' }. Sin esto cualquiera podría
+// registrar un "coordinador" falso y desviar a los jugadores, o leer las URLs
+// internas del mesh. (GET /coordinator es público: lo llama el navegador.)
+function requireCoordinator(req, res, next) {
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  try {
+    const payload = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
+    if (payload.role !== 'coordinator' || !COORD_ID_RE.test(payload.coordinatorId || '')) throw new Error('rol');
+    req.coordinatorId = payload.coordinatorId;
+    return next();
+  } catch (_) {
+    return res.status(401).json({ error: 'coordinator_token_required' });
+  }
+}
+
+app.post('/heartbeat', requireCoordinator, (req, res) => {
+  const { coordinatorId, publicUrl, peerUrl, connectedPlayers, uptime } = req.body || {};
+  if (typeof coordinatorId !== 'string' || !COORD_ID_RE.test(coordinatorId)) {
+    return res.status(400).json({ error: 'coordinatorId inválido (1-64: letras, números, _ o -)' });
+  }
+  // Un coordinador solo puede anunciarse a sí mismo
+  if (coordinatorId !== req.coordinatorId) return res.status(403).json({ error: 'coordinatorId no coincide con el token' });
+  if (typeof publicUrl !== 'string' || !WS_URL_RE.test(publicUrl)) return res.status(400).json({ error: 'publicUrl debe ser ws:// o wss://' });
+  if (typeof peerUrl !== 'string' || !WS_URL_RE.test(peerUrl)) return res.status(400).json({ error: 'peerUrl debe ser ws:// o wss://' });
+  if (!Number.isInteger(connectedPlayers) || connectedPlayers < 0) return res.status(400).json({ error: 'connectedPlayers debe ser un entero >= 0' });
+  if (typeof uptime !== 'number' || !(uptime >= 0)) return res.status(400).json({ error: 'uptime debe ser un número >= 0' });
+
+  if (!coordinators.has(coordinatorId)) console.log(`[directorio] + ${coordinatorId} (${publicUrl}, mesh ${peerUrl})`);
+  // assigned: clientes que /coordinator mandó aquí desde el último heartbeat
+  // (todavía no aparecen en connectedPlayers). El heartbeat trae la cifra real.
+  coordinators.set(coordinatorId, { coordinatorId, publicUrl, peerUrl, connectedPlayers, uptime, lastSeen: Date.now(), assigned: 0 });
+  return res.json({ ok: true });
+});
+
+// Client-side load balancing: el auth no reenvía tráfico, solo dice a qué
+// coordinador conectarse. Elige el de menos jugadores entre los vivos (en
+// empate, el primero). ?exclude=coord-x evita uno (el cliente lo usa para no
+// volver al coordinador que se le acaba de caer).
+app.get('/coordinator', (req, res) => {
+  const exclude = typeof req.query.exclude === 'string' ? req.query.exclude : null;
+  let best = null;
+  for (const c of aliveCoordinators()) {
+    if (c.coordinatorId === exclude) continue;
+    const load = c.connectedPlayers + c.assigned;
+    if (!best || load < best.connectedPlayers + best.assigned) best = c;
+  }
+  if (!best) return res.status(503).json({ error: 'no_coordinators_available' });
+  // Cuenta la asignación hasta el próximo heartbeat: si llegan 4 clientes en el
+  // mismo segundo no van los 4 al mismo coordinador
+  best.assigned += 1;
+  return res.json({ coordinatorId: best.coordinatorId, publicUrl: best.publicUrl });
+});
+
+app.get('/peers', requireCoordinator, (req, res) => {
+  res.json({ peers: aliveCoordinators().map((c) => ({ coordinatorId: c.coordinatorId, peerUrl: c.peerUrl })) });
+});
+
+// Vista de depuración del directorio (sin URLs internas del mesh)
+app.get('/coordinators', (req, res) => {
+  const now = Date.now();
+  res.json({
+    coordinators: aliveCoordinators(now).map((c) => ({
+      coordinatorId: c.coordinatorId, publicUrl: c.publicUrl, connectedPlayers: c.connectedPlayers,
+      uptime: c.uptime, lastSeenMsAgo: now - c.lastSeen,
+    })),
+  });
+});
+
 // Exportado para los tests (test/auth.test.js); al correr con `npm start` escucha.
-module.exports = { app, db, googleClient };
+module.exports = { app, db, googleClient, coordinators };
 
 if (require.main === module) {
   app.listen(PORT, () => console.log(`Auth service en puerto ${PORT}`));
