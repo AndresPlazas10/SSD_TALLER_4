@@ -285,7 +285,7 @@ CREATE TABLE users (
 - **Username sin distinguir mayúsculas**: `Alice`, `ALICE` y `alice` son el mismo usuario. El auth convierte el username a minúscula antes de registrar, loguear o crear la cuenta de Google (el login acepta cualquier combinación y el JWT lleva el nombre en minúscula). La base de datos lo exige por su cuenta: el `CHECK` rechaza cualquier username con mayúsculas aunque se inserte sin pasar por la API, y `COLLATE NOCASE` hace que el `UNIQUE` ignore mayúsculas. En el `CHECK` va `COLLATE BINARY` porque, si no, la comparación hereda el `NOCASE` de la columna y `'Alice' = 'alice'` daría verdadero.
 - **Migración a minúscula**: un `users.db` creado antes de este cambio se reconstruye al arrancar con cada username pasado a minúscula, conservando los `id`. Si ya hay dos usuarios que solo difieren en mayúsculas (`Ana` y `ana`), el auth **no arranca** y los lista en el error. Hay que resolverlo a mano (renombrar o borrar uno) porque no se puede saber cuál conservar.
 - **Migración automática**: si el `users.db` viene del Taller 1 (sin columna `provider`), al arrancar el auth copia esos usuarios como `provider = 'local'` conservando sus `id` (así los JWT y el coordinador siguen funcionando).
-- **Uber o Taxi (`vehicle`)**: se elige al registrarse (y en el primer ingreso con Google) y no se cambia después. La base solo acepta `'uber'` o `'taxi'` (`CHECK`). Un `users.db` anterior a esta columna la recibe al arrancar con `ALTER TABLE … ADD COLUMN` y sus usuarios quedan como `taxi`.
+- **Uber o Taxi (`vehicle`)**: se elige al registrarse (y en el primer ingreso con Google) y no se cambia después. En la página es obligatorio elegir; en la API es **opcional** y sin él se juega como `taxi`, así el contrato del enunciado (`{ username, password }`, `{ idToken, username }`) funciona tal cual. La base solo acepta `'uber'` o `'taxi'` (`CHECK`). Un `users.db` anterior a esta columna la recibe al arrancar con `ALTER TABLE … ADD COLUMN` y sus usuarios quedan como `taxi`.
 - Literales SQL con **comillas simples** (`'local'`); con comillas dobles SQLite los interpreta como nombres de columna (error típico #11).
 
 ---
@@ -294,13 +294,13 @@ CREATE TABLE users (
 
 | Método | Ruta | Body | Respuesta |
 |---|---|---|---|
-| POST | `/register` | `{ username, password, vehicle }` | `201 { userId, username, vehicle }` |
+| POST | `/register` | `{ username, password, vehicle? }` | `201 { userId, username, vehicle }` |
 | POST | `/login` | `{ username, password }` | `200 { token, username, vehicle }` |
 | POST | `/auth/google` | `{ idToken, username?, vehicle? }` | ver abajo |
 | GET | `/health` | — | `200 { ok: true }` |
 | GET | `/token-policy` | — | `200 { expiresInSeconds }` (duración vigente de `JWT_EXPIRES_IN`; la usa el coordinador) |
 
-**`/register`**: `409` si el username ya existe (en cualquier provider), `400` si el body es inválido (username 3–32 `[A-Za-z0-9_]`, password 6–72, `vehicle` distinto de `"uber"` o `"taxi"`) o el JSON está mal formado, `413` si el body supera 4 KB.
+**`/register`**: `409` si el username ya existe (en cualquier provider), `400` si el body es inválido (username 3–32 `[A-Za-z0-9_]`, password 6–72, `vehicle` presente pero distinto de `"uber"` o `"taxi"`) o el JSON está mal formado, `413` si el body supera 4 KB. **`vehicle` es opcional**: sin él la cuenta se crea como `taxi`, así `{ username, password }` (el contrato del enunciado) responde `201`. Las respuestas agregan `vehicle` a los campos del enunciado; quien espera `{ userId, username }` los recibe igual.
 
 **`/login`**: `401 { error: "Credenciales inválidas" }` si no coinciden; `401 { error: "use_google_login", hint }` si el usuario es de Google (no tiene contraseña); `400` si faltan campos.
 
@@ -313,7 +313,9 @@ CREATE TABLE users (
 | `username` ya usado (local o Google) | `409` | `{ error: "username_taken" }` |
 | ID token inválido (firma, `aud`, `iss`, vencido) | `401` | `{ error: "invalid_id_token" }` |
 | `email_verified` distinto de `true` | `401` | `{ error: "email_not_verified" }` |
-| Sin `idToken` / username con formato inválido / alta sin `vehicle` válido | `400` | `{ error }` |
+| Sin `idToken` / username con formato inválido / alta con `vehicle` inválido | `400` | `{ error }` |
+
+En el alta de `/auth/google`, `vehicle` también es opcional (sin él, `taxi`): `{ idToken, username }` funciona como en el enunciado. Si el usuario ya existe, el `vehicle` que llegue se ignora: el bando no se cambia después del registro.
 
 El JWT (de `/login` y de `/auth/google`) lleva `{ userId, username, provider, vehicle }`. Al ir firmado, el cliente no puede cambiar su bando.
 
@@ -321,7 +323,11 @@ El JWT (de `/login` y de `/auth/google`) lleva `{ userId, username, provider, ve
 
 ```bash
 curl -X POST http://localhost:4000/register -H "Content-Type: application/json" \
-  -d '{"username":"alice","password":"secret123","vehicle":"taxi"}'
+  -d '{"username":"alice","password":"secret123"}'
+# → 201 {"userId":1,"username":"alice","vehicle":"taxi"}  (sin vehicle = taxi)
+
+curl -X POST http://localhost:4000/register -H "Content-Type: application/json" \
+  -d '{"username":"carla","password":"secret123","vehicle":"uber"}'
 
 curl -X POST http://localhost:4000/login -H "Content-Type: application/json" \
   -d '{"username":"alice","password":"secret123"}'
@@ -417,7 +423,7 @@ Las casas se ven desde arriba con **techo a dos aguas**: dos faldones de distint
 - Al chocar, se empuja al auto solo lo que penetró, en la dirección de la pared. Por eso **se desliza** por el andén en vez de frenar en seco.
 - El cliente nunca decide si chocó. Si alguien modifica su cliente, igual no atraviesa las manzanas.
 
-**Uber o Taxi**: el jugador elige su bando al registrarse (`vehicle` en `/register`, o en el primer ingreso con Google). Queda guardado en la base y viaja **firmado en el JWT**: el coordinador lo lee del token validado, no de `extras`, así que nadie puede cambiarse de equipo desde DevTools. Los tokens anteriores a esta opción juegan como taxi.
+**Uber o Taxi**: el jugador elige su bando al registrarse (`vehicle` en `/register`, o en el primer ingreso con Google). La página obliga a elegir; en la API el campo es opcional y sin él se juega como taxi. Queda guardado en la base y viaja **firmado en el JWT**: el coordinador lo lee del token validado, no de `extras`, así que nadie puede cambiarse de equipo desde DevTools. Los tokens anteriores a esta opción juegan como taxi.
 - **Taxi**: amarillo, con franja de cuadros y letrero `TAXI` en el techo.
 - **Uber**: negro, con la placa de la `U` en el techo.
 - **Color según el bando**, validado por el coordinador (`sanitizeExtras`):
@@ -534,7 +540,7 @@ Igual que en la Parte I: gana la conexión nueva y la anterior se cierra con `40
 ## 12. Tests automáticos
 
 ```bash
-cd auth-service && npm test     # 26 tests: esquema, /register, /login, /auth/google, migración
+cd auth-service && npm test     # 28 tests: esquema, /register, /login, /auth/google, migración
 cd coordinator  && npm test     # 25 tests: geometría del mapa + coordinador real jugando por WebSocket
 ```
 

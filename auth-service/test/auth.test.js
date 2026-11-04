@@ -206,13 +206,26 @@ test('POST /register con username de Google -> 409 (username único entre provid
   assert.strictEqual((await post('/register', { username: 'bob_google', password: 'secret123', vehicle: 'taxi' })).status, 409);
 });
 
-test('POST /register: vehicle obligatorio, solo "uber" o "taxi"', async () => {
-  for (const vehicle of [undefined, '', 'bus', 'UBER', 1]) {
+test('POST /register: vehicle inválido -> 400 (solo "uber" o "taxi")', async () => {
+  for (const vehicle of ['', 'bus', 'UBER', 1, true, {}]) {
     const r = await post('/register', { username: 'sin_auto', password: 'secret123', vehicle });
     assert.strictEqual(r.status, 400, `vehicle=${vehicle}`);
     assert.match(r.data.error, /vehicle/);
   }
   assert.strictEqual(db.prepare('SELECT count(*) AS n FROM users WHERE username = ?').get('sin_auto').n, 0);
+});
+
+test('POST /register exactamente como el enunciado { username, password } -> 201 y juega como taxi', async () => {
+  const r = await post('/register', { username: 'como_el_pdf', password: 'secret123' });
+  assert.strictEqual(r.status, 201);
+  assert.strictEqual(r.data.username, 'como_el_pdf');
+  assert.ok(r.data.userId);
+  const row = db.prepare('SELECT provider, vehicle FROM users WHERE username = ?').get('como_el_pdf');
+  assert.deepStrictEqual({ ...row }, { provider: 'local', vehicle: 'taxi' });
+  const login = await post('/login', { username: 'como_el_pdf', password: 'secret123' });
+  assert.strictEqual(login.status, 200);
+  const payload = jwt.verify(login.data.token, JWT_SECRET);
+  assert.deepStrictEqual([payload.username, payload.provider, payload.vehicle], ['como_el_pdf', 'local', 'taxi']);
 });
 
 test('vehicle elegido al registrarse: se guarda y viaja en el JWT del login', async () => {
@@ -228,14 +241,23 @@ test('vehicle elegido al registrarse: se guarda y viaja en el JWT del login', as
   assert.throws(() => db.exec("UPDATE users SET vehicle = 'bus' WHERE username = 'alice'"), /CHECK/);
 });
 
-test('POST /auth/google: el alta exige vehicle y lo guarda en la fila y el JWT', async () => {
-  const sin = await post('/auth/google', { idToken: googleToken('g-veh'), username: 'veh_google' });
-  assert.strictEqual(sin.status, 400);
-  const r = await post('/auth/google', { idToken: googleToken('g-veh'), username: 'veh_google', vehicle: 'taxi' });
+test('POST /auth/google: alta exactamente como el enunciado { idToken, username } -> 200 como taxi', async () => {
+  const r = await post('/auth/google', { idToken: googleToken('g-veh'), username: 'veh_google' });
   assert.strictEqual(r.status, 200);
+  assert.strictEqual(r.data.username, 'veh_google');
   assert.strictEqual(jwt.verify(r.data.token, JWT_SECRET).vehicle, 'taxi');
-  // bob_google se dio de alta como uber: en logins posteriores lo conserva
-  const bob = await post('/auth/google', { idToken: googleToken('g-bob') });
+  assert.strictEqual(db.prepare('SELECT vehicle FROM users WHERE google_sub = ?').get('g-veh').vehicle, 'taxi');
+});
+
+test('POST /auth/google: vehicle inválido en el alta -> 400; un usuario existente conserva su bando', async () => {
+  const bad = await post('/auth/google', { idToken: googleToken('g-bus'), username: 'bus_google', vehicle: 'bus' });
+  assert.strictEqual(bad.status, 400);
+  assert.match(bad.data.error, /vehicle/);
+  assert.strictEqual(db.prepare('SELECT count(*) AS n FROM users WHERE google_sub = ?').get('g-bus').n, 0);
+  // bob_google se dio de alta como uber: en logins posteriores lo conserva,
+  // aunque mande otro vehicle
+  const bob = await post('/auth/google', { idToken: googleToken('g-bob'), vehicle: 'taxi' });
+  assert.strictEqual(bob.status, 200);
   assert.strictEqual(jwt.verify(bob.data.token, JWT_SECRET).vehicle, 'uber');
 });
 

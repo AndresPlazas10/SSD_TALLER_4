@@ -214,6 +214,15 @@ function validateVehicle(v) {
   return v === 'uber' || v === 'taxi' ? null : 'vehicle debe ser "uber" o "taxi"';
 }
 
+// vehicle es opcional en la API: el contrato del enunciado es
+// { username, password } y { idToken, username }, y así tiene que seguir
+// funcionando. Sin vehicle se juega como taxi; un valor presente pero
+// inválido ("bus") sí es un error. La página siempre obliga a elegir.
+const DEFAULT_VEHICLE = 'taxi';
+function vehicleOrDefault(v) {
+  return v === undefined || v === null ? DEFAULT_VEHICLE : v;
+}
+
 function validatePassword(p) {
   if (typeof p !== 'string') return 'password debe ser string';
   // bcrypt solo usa los primeros 72 bytes
@@ -223,7 +232,8 @@ function validatePassword(p) {
 
 // --- /register ---
 app.post('/register', async (req, res) => {
-  const { password, vehicle } = req.body || {};
+  const { password } = req.body || {};
+  const vehicle = vehicleOrDefault((req.body || {}).vehicle);
   const username = normalizeUsername((req.body || {}).username);
   const error = validateUsername(username) || validatePassword(password) || validateVehicle(vehicle);
   if (error) return res.status(400).json({ error });
@@ -278,7 +288,9 @@ app.post('/login', async (req, res) => {
 
 // --- /auth/google (Opción A: Google Identity Services) ---
 app.post('/auth/google', async (req, res) => {
-  const { idToken, vehicle } = req.body || {};
+  const { idToken } = req.body || {};
+  // Solo se usa en el alta; un usuario existente conserva su bando
+  const vehicle = vehicleOrDefault((req.body || {}).vehicle);
   const username = normalizeUsername((req.body || {}).username);
 
   if (typeof idToken !== 'string') {
@@ -318,7 +330,7 @@ app.post('/auth/google', async (req, res) => {
   if (!username) {
     return res.status(409).json({
       error: 'username_required',
-      hint: 'Primer login con Google: elige un username y si eres Uber o Taxi.',
+      hint: 'Primer login con Google: elige un username.',
     });
   }
 
