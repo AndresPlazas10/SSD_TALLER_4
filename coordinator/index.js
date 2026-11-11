@@ -26,10 +26,30 @@ const COORDINATOR_ID = cliArg('id') || process.env.COORDINATOR_ID || `coord-${PO
 const PEER_PORT = parseInt(cliArg('peer-port') || process.env.PEER_PORT || String(PORT + 100), 10);
 // URLs que se anuncian en el directorio. PUBLIC_HOST = IP/host por el que los
 // navegadores llegan a este equipo; PUBLIC_URL / PEER_URL completas las
-// reemplazan (p. ej. un túnel wss:// de ngrok).
-const PUBLIC_HOST = process.env.PUBLIC_HOST || 'localhost';
-const PUBLIC_URL = cliArg('public-url') || process.env.PUBLIC_URL || `ws://${PUBLIC_HOST}:${PORT}`;
-const PEER_URL = cliArg('peer-url') || process.env.PEER_URL || `ws://${PUBLIC_HOST}:${PEER_PORT}`;
+// reemplazan (p. ej. un túnel wss:// de ngrok). Si se pega https://... o con
+// barra final /, se normaliza automáticamente a wss://... sin barra.
+function normalizeWsUrl(raw) {
+  const v = (raw || '').trim().replace(/\/+$/, '');
+  if (!v || /TU-URL|PONER-AQUI|NGROK-DEL|NGROK-COORD|auto-(rojo|azul|verde)/i.test(v)) return '';
+  return v.replace(/^https:\/\//i, 'wss://').replace(/^http:\/\//i, 'ws://');
+}
+// Sufijo para permitir PUBLIC_URL_A / PUBLIC_URL_B / PUBLIC_URL_C en un mismo .env
+const idSuffix = COORDINATOR_ID.replace(/^coord-/i, '').toUpperCase();
+const PUBLIC_HOST = (process.env.PUBLIC_HOST || 'localhost').trim();
+const explicitPublicUrl = normalizeWsUrl(
+  cliArg('public-url')
+  || process.env[`PUBLIC_URL_${idSuffix}`]
+  || process.env.PUBLIC_URL
+);
+const explicitPeerUrl = normalizeWsUrl(
+  cliArg('peer-url')
+  || process.env[`PEER_URL_${idSuffix}`]
+  || process.env.PEER_URL
+);
+const PUBLIC_URL = explicitPublicUrl || `ws://${PUBLIC_HOST}:${PORT}`;
+// Si hay túnel público (p. ej. wss:// de ngrok) y no se dio PEER_URL aparte,
+// el mesh usa ese mismo túnel (el mismo puerto PORT acepta conexiones del mesh).
+const PEER_URL = explicitPeerUrl || (explicitPublicUrl.startsWith('wss://') ? explicitPublicUrl : `ws://${PUBLIC_HOST}:${PEER_PORT}`);
 const STARTED_AT = Date.now();
 const JWT_SECRET = process.env.JWT_SECRET;
 const HEARTBEAT_MS = parseInt(process.env.HEARTBEAT_MS || '30000', 10);
@@ -527,6 +547,10 @@ server.on('upgrade', (req, socket, head) => {
   const token = searchParams.get('token');
 
   if (pathname !== '/connect') {
+    if (mesh && (pathname === '/' || pathname === '/mesh')) {
+      mesh.handleUpgrade(req, socket, head);
+      return;
+    }
     socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
     socket.destroy();
     return;

@@ -71,9 +71,10 @@ function createMesh({ id, peerPort, publicUrl, peerUrl, authUrl, secret, started
     onPeerUp(peerId);
   }
 
-  // Lado que recibe: espera el hello; contesta con el suyo
-  const server = new WebSocketServer({ port: peerPort, maxPayload: MAX_PEER_MESSAGE_BYTES });
-  server.on('connection', (ws) => {
+  // Lado que recibe: espera el hello; contesta con el suyo.
+  // Acepta conexiones tanto en PEER_PORT (local/LAN) como en el mismo PORT del
+  // coordinador (handleUpgrade, útil cuando se expone un único túnel ngrok).
+  function onIncoming(ws) {
     ws.on('error', () => {});
     const timer = setTimeout(() => ws.close(4008, 'hello timeout'), HELLO_TIMEOUT_MS);
     ws.once('message', (raw) => {
@@ -87,14 +88,24 @@ function createMesh({ id, peerPort, publicUrl, peerUrl, authUrl, secret, started
       ws.send(hello());
       register(ok.peerId, ok.startedAt, ws);
     });
-  });
+  }
+  const server = new WebSocketServer({ port: peerPort, maxPayload: MAX_PEER_MESSAGE_BYTES });
+  server.on('connection', onIncoming);
   server.on('error', (err) => console.error(`[mesh] no se pudo escuchar en ${peerPort}: ${err.message}`));
+  const upgradeServer = new WebSocketServer({ noServer: true, maxPayload: MAX_PEER_MESSAGE_BYTES });
+  function handleUpgrade(req, socket, head) {
+    upgradeServer.handleUpgrade(req, socket, head, onIncoming);
+  }
 
   // Lado que inicia: manda su hello y espera el del otro
   function connectTo(peer) {
     if (connecting.has(peer.coordinatorId) || peers.has(peer.coordinatorId)) return;
     connecting.add(peer.coordinatorId);
-    const ws = new WebSocket(peer.peerUrl, { maxPayload: MAX_PEER_MESSAGE_BYTES, handshakeTimeout: HELLO_TIMEOUT_MS });
+    const ws = new WebSocket(peer.peerUrl, {
+      maxPayload: MAX_PEER_MESSAGE_BYTES,
+      handshakeTimeout: HELLO_TIMEOUT_MS,
+      headers: { 'ngrok-skip-browser-warning': 'true' },
+    });
     const done = () => connecting.delete(peer.coordinatorId);
     ws.on('error', done);
     ws.on('close', done);
@@ -118,7 +129,7 @@ function createMesh({ id, peerPort, publicUrl, peerUrl, authUrl, secret, started
     const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${token()}`, 'ngrok-skip-browser-warning': 'true' };
     try {
       const hb = await fetch(`${authUrl}/heartbeat`, {
-        method: 'POST', headers, signal: AbortSignal.timeout(1500),
+        method: 'POST', headers, signal: AbortSignal.timeout(4500),
         body: JSON.stringify({
           coordinatorId: id, publicUrl, peerUrl,
           connectedPlayers: getConnectedPlayers(),
@@ -126,7 +137,7 @@ function createMesh({ id, peerPort, publicUrl, peerUrl, authUrl, secret, started
         }),
       });
       if (!hb.ok) throw new Error(`heartbeat HTTP ${hb.status}`);
-      const res = await fetch(`${authUrl}/peers`, { headers, signal: AbortSignal.timeout(1500) });
+      const res = await fetch(`${authUrl}/peers`, { headers, signal: AbortSignal.timeout(4500) });
       if (!res.ok) throw new Error(`peers HTTP ${res.status}`);
       const body = await res.json();
       if (directoryOk === false) console.log('[mesh] el directorio responde de nuevo');
@@ -180,7 +191,7 @@ function createMesh({ id, peerPort, publicUrl, peerUrl, authUrl, secret, started
   }
 
   return {
-    send, sendTo, close,
+    send, sendTo, close, handleUpgrade,
     isLeader: () => leader() === id,
     leader,
     peerIds: () => Array.from(peers.keys()),

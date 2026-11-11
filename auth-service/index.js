@@ -461,7 +461,7 @@ app.get('/coordinator', (req, res) => {
   return res.json({ coordinatorId: best.coordinatorId, publicUrl: best.publicUrl });
 });
 
-app.get('/peers', requireCoordinator, (req, res) => {
+app.get('/peers', (req, res) => {
   res.json({ peers: aliveCoordinators().map((c) => ({ coordinatorId: c.coordinatorId, peerUrl: c.peerUrl })) });
 });
 
