@@ -1512,14 +1512,18 @@
         return data;
       }
 
-      async function connect(exclude = null) {
+      // silent: mudanza por balanceo; la conexión actual sigue funcionando
+      // mientras se busca la nueva, así que no se muestra nada
+      async function connect(exclude = null, { silent = false } = {}) {
         clearTimeout(reconnectTimer);
         const attempt = ++connectAttempt;
-        setStatus('Buscando coordinador…', false);
+        if (!silent) setStatus('Buscando coordinador…', false);
         let target;
         try {
           target = await pickCoordinator(exclude);
         } catch (err) {
+          // En una mudanza no pasa nada: se sigue en el coordinador actual
+          if (silent) { console.log(`[lobby] no hay otro coordinador para mudarse (${err.message})`); return; }
           // Sin coordinadores vivos (503) o auth caído: reintentar sin excluir a nadie
           setStatus('Sin coordinadores disponibles, reintentando…', false);
           console.log(`[lobby] /coordinator falló (${err.message}); reintento en 2 s`);
@@ -1610,6 +1614,13 @@
             sessionEndsAt = typeof msg.expiresInMs === 'number' ? performance.now() + msg.expiresInMs : null;
           } else if (msg.type === 'players_update') {
             renderPlayers(msg.players);
+          } else if (msg.type === 'migrate') {
+            // Balanceo: este coordinador está más cargado que otro. Se pide otro
+            // al directorio y se conecta ANTES de soltar este (ver connect):
+            // la sesión nueva sigue con la misma posición y puntaje y este
+            // cierra la vieja. El jugador no nota nada.
+            console.log(`[lobby] ${sock.coordinatorId} pide mudarse para balancear la carga`);
+            connect(sock.coordinatorId, { silent: true });
           } else if (msg.type === 'match_start') {
             toast = { text: `🏁 ¡Empieza la ronda ${msg.round}! Recoge pasajeros para tu equipo`, mine: true, until: performance.now() + 3000 };
           } else if (msg.type === 'pickup') {
@@ -1681,8 +1692,10 @@
         loggingOut = false;
         const dead = sock.coordinatorId;
         console.log(`[lobby] se perdió ${dead} (código ${event.code}): buscando otro coordinador`);
-        coordChip.textContent = `🖧 ${dead} caído · reconectando…`;
-        toast = { text: `Se perdió ${dead}: conectando a otro coordinador…`, mine: false, until: performance.now() + 4000 };
+        // Sin avisos grandes: el auto sigue donde estaba al reconectarse (el
+        // resto de coordinadores lo guardan en espera), así que el jugador
+        // casi no nota el cambio; solo se actualiza el indicador
+        coordChip.textContent = '🖧 reconectando…';
         setStatus('Reconectando…', false);
         ws = null;
         const wait = [300, 1000, 2000, 3000][Math.min(failedTries, 3)];
