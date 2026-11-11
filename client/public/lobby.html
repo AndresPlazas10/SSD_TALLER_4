@@ -106,6 +106,40 @@
     // entre dos posiciones que ya mandó el servidor (no se predice nada).
     let prevState = null;
     let lastStateAt = 0;
+
+    // Búfer de interpolación: los autos se dibujan INTERP_MS "en el pasado",
+    // entre los dos state que rodean ese instante. Cada state se ubica en el
+    // tiempo con la hora del tick del SERVIDOR (msg.t), no con la hora en que
+    // llegó: en Windows los mensajes llegan a intervalos irregulares y dibujar
+    // según la llegada hacía que el movimiento se viera a tirones.
+    const INTERP_MS = 80;
+    const stateBuffer = []; // [{ t: hora del tick en el servidor, state }], en orden
+    let clockOffset = null; // hora local - hora del servidor (el menor visto = menos demora de red)
+    function pushState(msg) {
+      const off = Date.now() - msg.t;
+      // Baja de golpe (llegó un mensaje más rápido) y sube despacio (si la red
+      // se vuelve más lenta o los relojes derivan)
+      clockOffset = clockOffset === null || off < clockOffset ? off : clockOffset + (off - clockOffset) * 0.01;
+      stateBuffer.push({ t: msg.t, state: msg });
+      while (stateBuffer.length > 2 && stateBuffer[0].t < msg.t - 1000) stateBuffer.shift();
+    }
+    function resetStateBuffer() {
+      stateBuffer.length = 0;
+      clockOffset = null;
+    }
+    // [state anterior, state siguiente, fracción] para el instante de dibujo,
+    // expresado en la hora del servidor con la estimación de reloj vigente
+    function interpFrame() {
+      const n = stateBuffer.length;
+      if (!n) return [lastState, lastState, 1];
+      const t = Date.now() - clockOffset - INTERP_MS;
+      if (t <= stateBuffer[0].t) return [stateBuffer[0].state, stateBuffer[0].state, 1];
+      for (let i = n - 1; i > 0; i--) {
+        const a = stateBuffer[i - 1], b = stateBuffer[i];
+        if (t >= a.t) return [a.state, b.state, t >= b.t ? 1 : (t - a.t) / (b.t - a.t)];
+      }
+      return [stateBuffer[n - 1].state, stateBuffer[n - 1].state, 1];
+    }
     // { width, height, playerRadius, tickRate, passengerRadius, cell, obstacles } desde 'welcome'
     let world = null;
     let myUserId = null;
@@ -278,7 +312,9 @@
         stage.dataset.msg = 'Tu navegador no tiene WebGL activo: no se puede mostrar la vista 3D.';
         return false;
       }
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+      // Resolución 1:1 (en pantallas de alta densidad dibujar a 1,5x o 2x
+      // multiplica el trabajo de la tarjeta de video sin ganar casi nada)
+      renderer.setPixelRatio(1);
       renderer.shadowMap.enabled = true;
       renderer.shadowMap.type = THREE.PCFSoftShadowMap;
       stage.prepend(renderer.domElement);
@@ -293,7 +329,7 @@
       // una sola sombra para todo el mapa.
       sun = new THREE.DirectionalLight('#ffffff', 0.85);
       sun.castShadow = true;
-      sun.shadow.mapSize.set(2048, 2048);
+      sun.shadow.mapSize.set(1024, 1024);
       Object.assign(sun.shadow.camera, { left: -500, right: 500, top: 500, bottom: -500, near: 10, far: 2000 });
       scene.add(sun, sun.target);
 
@@ -1165,19 +1201,42 @@
       el.style.transform = `translate(${((projected.x + 1) / 2) * viewSize.w}px, ${((1 - projected.y) / 2) * viewSize.h}px) translate(-50%, -100%)`;
     }
 
+    // Calidad automática: si el equipo no llega a ~30 cuadros por segundo
+    // durante 3 s, se apagan las sombras y se baja la resolución. Es lo que más
+    // pesa en equipos modestos o con varias pestañas del juego abiertas.
+    let frameAvg = 16, slowSince = 0, lowQuality = false, lastFrameAt = 0;
+    function adaptQuality(now) {
+      const dt = lastFrameAt ? now - lastFrameAt : 16;
+      lastFrameAt = now;
+      if (lowQuality || dt > 500) return; // pestaña que vuelve de segundo plano: no cuenta
+      frameAvg += (dt - frameAvg) * 0.05;
+      if (frameAvg < 34) { slowSince = 0; return; }
+      if (!slowSince) slowSince = now;
+      if (now - slowSince < 3000) return;
+      lowQuality = true;
+      sun.castShadow = false;
+      renderer.setPixelRatio(0.75);
+      resize3D();
+      console.log(`[lobby] ${Math.round(1000 / frameAvg)} fps: se bajó la calidad gráfica (sin sombras, 75 % de resolución)`);
+      toast = { text: 'Calidad gráfica reducida para que el juego vaya fluido', mine: false, until: now + 3000 };
+    }
+
     function render() {
       requestAnimationFrame(render);
       updateSessionTimer(performance.now()); // aunque no haya 3D
       updateMatchHud(performance.now());
       if (!world || !renderer) return;
       const now = performance.now();
+      adaptQuality(now);
       let myPos = null;
       if (lastState) {
-        // Interpolación de dibujo: avanza de prevState a lastState durante un tick.
-        const alpha = Math.min((now - lastStateAt) / (1000 / world.tickRate), 1);
-        const prev = new Map(prevState ? prevState.players.map((p) => [p.userId, p]) : []);
+        // Interpolación de dibujo entre los dos state que rodean el instante
+        // de dibujo (ver interpFrame). Solo posiciones que ya mandó el
+        // servidor: no se predice nada.
+        const [from, to, alpha] = interpFrame();
+        const prev = new Map(from.players.map((p) => [p.userId, p]));
         const seen = new Set();
-        for (const p of lastState.players) {
+        for (const p of to.players) {
           const id = String(p.userId);
           seen.add(id);
           let car = cars.get(id);
@@ -1432,6 +1491,9 @@
       const coordChip = document.getElementById('coord-chip');
       let reconnectTimer = null;
       let connectAttempt = 0;
+      let lastMsgAt = 0;        // último mensaje del coordinador (watchdog)
+      let failedTries = 0;      // intentos seguidos sin éxito (espera creciente)
+      let builtCityKey = null;  // la ciudad ya armada (no se rehace al reconectar)
 
       function setStatus(text, online) {
         const status = document.getElementById('status');
@@ -1469,9 +1531,23 @@
 
         // encodeURIComponent: si el token se "ensucia" con caracteres como # o espacios,
         // new WebSocket() lanzaría error en vez de dejar que el coordinador lo rechace.
-        const sock = new WebSocket(`${target.publicUrl}/connect?token=${encodeURIComponent(currentToken)}`);
+        let sock;
+        try {
+          sock = new WebSocket(`${target.publicUrl}/connect?token=${encodeURIComponent(currentToken)}`);
+        } catch (err) {
+          // publicUrl inválida (coordinador mal configurado, p. ej. "wss://https://..."):
+          // no trabar la página; probar otro coordinador
+          console.log(`[lobby] ${target.coordinatorId} anuncia una URL inválida (${target.publicUrl}): se prueba otro`);
+          setStatus('Coordinador mal configurado, probando otro…', false);
+          reconnectTimer = setTimeout(() => connect(target.coordinatorId), 1000);
+          return;
+        }
         sock.coordinatorId = target.coordinatorId || 'coordinador';
         ws = sock;
+        lastMsgAt = Date.now();
+        // Si el coordinador no responde (equipo apagado, red caída) el navegador
+        // puede tardar mucho en rendirse: a los 4 s se da por fallido
+        setTimeout(() => { if (sock === ws && sock.readyState === WebSocket.CONNECTING) sock.close(); }, 4000);
 
         sock.onopen = () => {
           if (sock !== ws) return;
@@ -1480,6 +1556,7 @@
 
         sock.onmessage = (event) => {
           if (sock !== ws) return;
+          lastMsgAt = Date.now();
           const msg = JSON.parse(event.data);
           if (msg.type === 'welcome') {
             world = msg.world;
@@ -1489,12 +1566,21 @@
             coordChip.textContent = `🖧 Coordinador: ${sock.coordinatorId} · ${world.tickRate} Hz`;
             coordChip.hidden = false;
             setStatus(`En línea · ${sock.coordinatorId}`, true);
-            // Se arma la escena 3D con el mapa recibido
+            failedTries = 0;
+            // Otro coordinador puede tener otro reloj: el búfer arranca de cero
+            resetStateBuffer();
+            // Se arma la escena 3D con el mapa recibido. Todos los coordinadores
+            // generan la misma ciudad: al reconectar no se rehace (rehacerla
+            // congelaba la pantalla unos segundos en equipos lentos).
             if (init3D()) {
               resize3D();
-              buildCity3D();
+              const key = `${world.width}x${world.height}:${world.blocks.length}:${world.obstacles.length}`;
+              if (key !== builtCityKey) {
+                buildCity3D();
+                builtCityKey = key;
+                snapCamera();
+              }
               showRadar();
-              snapCamera();
             }
             // El nombre viene del JWT validado: si el token cambió de usuario, se actualiza
             document.getElementById('me').textContent = msg.you.username;
@@ -1518,6 +1604,7 @@
             prevState = lastState;
             lastState = msg;
             lastStateAt = performance.now();
+            pushState(msg);
             updateScores(msg.players);
           } else if (msg.type === 'session') {
             sessionEndsAt = typeof msg.expiresInMs === 'number' ? performance.now() + msg.expiresInMs : null;
@@ -1588,7 +1675,9 @@
           return;
         }
         // Se cayó el coordinador (o la red): la sesión sigue. Se pide otro
-        // coordinador al directorio, excluyendo el que se cayó.
+        // coordinador al directorio (el menos cargado), excluyendo el que se
+        // cayó. Primer intento casi inmediato; si sigue fallando, espera
+        // creciente (0,3 s, 1 s, 2 s, máx. 3 s).
         loggingOut = false;
         const dead = sock.coordinatorId;
         console.log(`[lobby] se perdió ${dead} (código ${event.code}): buscando otro coordinador`);
@@ -1596,8 +1685,33 @@
         toast = { text: `Se perdió ${dead}: conectando a otro coordinador…`, mine: false, until: performance.now() + 4000 };
         setStatus('Reconectando…', false);
         ws = null;
-        reconnectTimer = setTimeout(() => connect(dead === 'coordinador' ? null : dead), 1000);
+        const wait = [300, 1000, 2000, 3000][Math.min(failedTries, 3)];
+        failedTries += 1;
+        reconnectTimer = setTimeout(() => connect(dead === 'coordinador' ? null : dead), wait);
       }
+
+      // Watchdog: el coordinador manda un state 20 veces por segundo. Si pasan
+      // 3,5 s sin nada, la conexión está muerta aunque el navegador no se haya
+      // dado cuenta (equipo colgado, red caída, túnel que no avisa): se cierra
+      // y se busca otro coordinador.
+      setInterval(() => {
+        if (!ws || ws.readyState !== WebSocket.OPEN || loggingOut) return;
+        if (Date.now() - lastMsgAt < 3500) return;
+        const stale = ws;
+        console.log(`[lobby] ${stale.coordinatorId} no manda datos hace ${Date.now() - lastMsgAt} ms: se da por caído`);
+        onSocketClose(stale, { code: 4900, reason: 'sin datos' }); // ws pasa a null: el close de abajo se ignora
+        stale.close();
+      }, 1000);
+
+      // Las pestañas en segundo plano frenan los temporizadores: al volver a la
+      // pestaña (o al volver la red) se reconecta en el acto si hacía falta
+      function reconnectNowIfNeeded() {
+        if (loggingOut || ws || document.hidden) return;
+        clearTimeout(reconnectTimer);
+        connect();
+      }
+      document.addEventListener('visibilitychange', reconnectNowIfNeeded);
+      window.addEventListener('online', reconnectNowIfNeeded);
 
       connect();
 
