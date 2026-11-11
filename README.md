@@ -92,7 +92,9 @@ El resultado, comprobado en el test de integración: Alice tiene **la misma posi
 
 1. Después del login, el lobby pide `GET /coordinator` al auth y abre el WS al `publicUrl` que le devuelve.
 2. Muestra a qué coordinador está conectado, en la barra superior ("En línea · coord-b") y dentro del juego (**🖧 Coordinador: coord-b · 20 Hz**). El `welcome` del coordinador confirma su id.
-3. Si el WS se cae por algo que no es el token (`4001`) ni otra pestaña (`4002`), **no** vuelve directo al mismo coordinador: avisa "Se perdió coord-b…", pide `GET /coordinator?exclude=coord-b` y se conecta al que le digan. **La sesión sigue**, sin pasar por el login. Si no hay coordinadores vivos (`503`), reintenta cada 2 s.
+3. Si el WS se cae por algo que no es el token (`4001`) ni otra pestaña (`4002`), **no** vuelve directo al mismo coordinador: avisa "Se perdió coord-b…", pide `GET /coordinator?exclude=coord-b` y se conecta al que le digan (el **menos cargado** de los vivos). **La sesión sigue**, sin pasar por el login ni recargar. Primer reintento a los 0,3 s; si sigue fallando, 1 s, 2 s y 3 s. Si no hay coordinadores vivos (`503`), reintenta cada 2 s. Comprobado en un Edge real: con coord-a = 0, coord-b = 2 y coord-c = 0 jugadores, al matar coord-a la página pasó a **coord-c** en 0,4 s.
+4. **Caídas silenciosas**: si el coordinador se cuelga o la red se corta sin cerrar el socket (otro equipo, Wi-Fi, un túnel que no avisa), el navegador no se entera solo. Como el coordinador manda un `state` 20 veces por segundo, si pasan **3,5 s sin datos** el cliente da la conexión por muerta y busca otro. Si un coordinador no responde al conectar, a los 4 s se prueba otro.
+5. Si el coordinador anuncia una URL inválida, el cliente no se traba: prueba otro. Al volver a la pestaña (las pestañas en segundo plano frenan los temporizadores) o al volver la red, reconecta en el acto si hacía falta.
 
 ### 0.5 Levantar tres coordinadores
 
@@ -121,7 +123,38 @@ En **equipos distintos**, cada coordinador usa en su `.env` `COORDINATOR_ID` (ú
 | `PUBLIC_URL` / `PEER_URL` | `wss://….ngrok-free.app` | URLs completas, si no sirven las armadas con `PUBLIC_HOST` |
 | `AUTH_URL` | `http://192.168.1.10:4000` | Directorio. **Vacío = coordinador solo**, sin mesh: es como corren los tests del Taller 5 |
 
-### 0.6 Guion de la sustentación (Taller 6)
+### 0.6 Despliegue con ngrok (un túnel por equipo)
+
+ngrok gratis da **un solo dominio por cuenta**, así que no alcanza para un túnel de jugadores y otro del mesh. Por eso el mesh puede ir **por el mismo puerto** que los jugadores, en la ruta `/mesh`: basta con poner `PEER_PORT` igual a `PORT`. En el `.env` de cada coordinador:
+
+```bash
+PORT=5002
+PEER_PORT=5002                                   # mismo puerto: el mesh va por /mesh
+COORDINATOR_ID=coord-b                           # único por coordinador
+PUBLIC_URL=wss://TU-DOMINIO.ngrok-free.dev       # SIN https:// y sin ruta
+# PEER_URL se arma sola: wss://TU-DOMINIO.ngrok-free.dev/mesh
+# (el coordinador acepta el mesh en /mesh y también en la raíz: sirve un
+#  PEER_URL que sea solo el dominio del túnel)
+AUTH_URL=https://DOMINIO-DEL-AUTH.ngrok-free.dev
+JWT_SECRET=<la misma que el auth>
+```
+
+y en ese equipo `ngrok http 5002`.
+
+- **Errores típicos que ahora se detectan:**
+  - `PUBLIC_URL=wss://https://…` (protocolo repetido) o con ruta (`…/task/capabilities`): el coordinador **no arranca** y explica el error, y el directorio responde `400` con el motivo.
+  - Un `PEER_URL` en `localhost` con el directorio en otro equipo: el coordinador avisa al arrancar que los demás no podrán conectarse a él.
+- **Cada coordinador necesita su propio túnel y su propio `PUBLIC_URL`.** Si dos coordinadores anuncian la misma URL, el directorio manda jugadores "a coord-a" que en realidad terminan en el coordinador al que apunta el túnel, y la reconexión ante una caída no funciona.
+- **Latencia**: cada mensaje del juego pasa por los servidores de ngrok (gratis, lejos), lo que suma demora. El cliente interpola para que se vea fluido, pero la respuesta a las teclas depende de esa demora. Para jugar con la menor demora, conviene la LAN (`PUBLIC_HOST=<IP>`) y dejar ngrok para la sustentación.
+
+### 0.7 Fluidez
+
+- **Interpolación con búfer**: el cliente ubica cada `state` en el tiempo según la hora del tick en el servidor (`t`), no según cuándo llegó, y dibuja 80 ms en el pasado, entre los dos `state` que rodean ese instante. En Windows los mensajes llegan a intervalos irregulares, y dibujar según la llegada hacía que el movimiento se viera a tirones.
+- **Corrección suave entre coordinadores**: `player_sync` ya no hace saltar a los autos remotos a la posición del dueño. Los acerca un 35 % por sync en movimiento y un 60 % si están quietos, y solo salta si la diferencia supera 3 radios.
+- **Calidad automática**: el 3D dibuja a resolución 1:1, con sombras de 1024 px. Si el equipo no llega a ~30 cuadros por segundo durante 3 s, se apagan las sombras y se baja la resolución al 75 %, con un aviso en pantalla.
+- **Reconexión sin congelar**: todos los coordinadores generan la misma ciudad, así que al pasar a otro coordinador la escena 3D no se rehace.
+
+### 0.8 Guion de la sustentación (Taller 6)
 
 1. **Tres coordinadores en `/peers`**: levantar `start:a`, `start:b` y `start:c`. Mostrar `http://localhost:4000/coordinators` con los tres vivos. `/peers` necesita token de coordinador; el test `coordinator/test/mesh.test.js` lo consulta tal cual.
 2. **Reparto de 4 clientes**: abrir 4 pestañas o ventanas de incógnito con usuarios distintos. Cada una muestra su coordinador, por ejemplo `coord-a, coord-b, coord-c, coord-a`, y `/coordinators` muestra la carga.
@@ -700,14 +733,14 @@ Igual que en la Parte I: gana la conexión nueva y la anterior se cierra con `40
 ## 12. Tests automáticos
 
 ```bash
-cd auth-service && npm test     # 37 tests (28 + 9 del directorio): esquema, /register, /login, /auth/google, migración
-cd coordinator  && npm test     # 35 tests (30 + 5 del mesh con procesos reales): geometría del mapa + coordinador real jugando por WebSocket
+cd auth-service && npm test     # 37 tests (28 + 9 del directorio, con URLs mal configuradas): esquema, /register, /login, /auth/google, migración
+cd coordinator  && npm test     # 37 tests (30 + 7 del mesh con procesos reales): geometría del mapa + coordinador real jugando por WebSocket
 ```
 
 - **Auth**: los ID tokens de prueba (`fake:<json>`) se resuelven con un stub de `verifyIdToken` (no hace falta una cuenta de Google); cualquier otro token pasa por la verificación **real** de `google-auth-library` y debe ser rechazado (token falsificado con firma propia → `401`).
 - **Coordinador**: `welcome`, 20 Hz, velocidad con `{x: 9999}`, diagonales, spam de intents, clamp a los bordes, mensajes inválidos (`null`, arrays, strings), replicación de extras, mensaje > 4 KB, `players_update`, `4002` conservando posición, `4001` por token vencido, `SESSION_MAX_AGE` en caliente, cambio de `JWT_EXPIRES_IN` en el auth (vía `/token-policy`) que cierra una sesión abierta al cumplirse la nueva duración contada desde el cambio (no al instante), pasajero (se recoge, suma 1 y reaparece), ciudad (12 manzanas con casas, conjuntos, edificios y parques; el auto no atraviesa ninguna en 8 direcciones; el pasajero nunca cae dentro de una), `vehicle` leído del JWT (sin `vehicle` = taxi; `extras` no lo cambia), color por bando (el taxi no puede cambiarlo, el Uber no puede usar amarillo), marcador por equipo (solo suma a los conectados; al cerrar sesión se descuenta y al volver arranca en 0) choque entre autos (no se superponen), reversa (no gira, 60 % de velocidad, solo con `reverse: true`) y partida por rondas (fin de ronda, ganador, podio y ronda nueva en 0).
 - **Directorio** (`auth-service/test/directory.test.js`): heartbeat que registra al coordinador, 401 sin token de coordinador y 403 si el token es de otro, validaciones 400, el menos cargado con empate al primero, reparto de 4 clientes que llegan juntos, `exclude`, 503 sin coordinadores, descarte por TTL (también de `/peers`) y `/peers` con token.
-- **Mesh** (`coordinator/test/mesh.test.js`): levanta el **auth real y tres coordinadores reales** y recorre la sustentación: los tres en `/peers` y en un mesh completo con un solo líder, 4 clientes repartidos, Alice en coord-a y Bob en coord-b que se ven moverse con **la misma posición en los dos coordinadores**, extras, pasajero y ronda replicados, la misma cuenta abierta en otro coordinador (4002 conservando la posición), y la caída de coord-b: sus clientes se desconectan, el auth deja de devolverlo, desaparece de `/peers` y el cliente se reconecta a uno vivo. Los archivos de test corren de a uno (`--test-concurrency=1`) para que el del mesh no compita por CPU y puertos con los demás.
+- **Mesh** (`coordinator/test/mesh.test.js`): levanta el **auth real y tres coordinadores reales** y recorre la sustentación: los tres en `/peers` y en un mesh completo con un solo líder, 4 clientes repartidos, Alice en coord-a y Bob en coord-b que se ven moverse con **la misma posición en los dos coordinadores**, extras, pasajero y ronda replicados, la misma cuenta abierta en otro coordinador (4002 conservando la posición), la caída de coord-b (sus clientes se desconectan, el auth deja de devolverlo, desaparece de `/peers` y el cliente se reconecta a uno vivo), un coordinador con el **mesh por el mismo puerto** (`/mesh`, como con ngrok) que se une y replica, y un coordinador con `PUBLIC_URL` mal escrita que no arranca y explica el error. Los tests ignoran las URLs y puertos de despliegue del `.env` de desarrollo. Los archivos de test corren de a uno (`--test-concurrency=1`) para que el del mesh no compita por CPU y puertos con los demás.
 - **Mapa** (`test/map.test.js`): colisión círculo-polígono y círculo-círculo, salida por el lado más cercano, polígono cóncavo (L).
 
 ---
