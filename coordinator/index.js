@@ -46,11 +46,36 @@ const explicitPeerUrl = normalizeWsUrl(
   || process.env[`PEER_URL_${idSuffix}`]
   || process.env.PEER_URL
 );
+// Mesh por el MISMO puerto que los jugadores (PEER_PORT = PORT): no se abre un
+// puerto aparte para el mesh. Sirve con ngrok, donde cada cuenta gratis tiene
+// un solo dominio/túnel.
+const MESH_SHARED_PORT = PEER_PORT === PORT;
 const PUBLIC_URL = explicitPublicUrl || `ws://${PUBLIC_HOST}:${PORT}`;
-// Si hay túnel público (p. ej. wss:// de ngrok) y no se dio PEER_URL aparte,
-// el mesh usa ese mismo túnel (el mismo puerto PORT acepta conexiones del mesh).
-const PEER_URL = explicitPeerUrl || (explicitPublicUrl.startsWith('wss://') ? explicitPublicUrl : `ws://${PUBLIC_HOST}:${PEER_PORT}`);
+// Si hay túnel público (p. ej. wss:// de ngrok) o el mesh comparte el puerto, y
+// no se dio PEER_URL aparte, el mesh usa la misma URL (el puerto PORT acepta
+// conexiones del mesh en / y en /mesh).
+const PEER_URL = explicitPeerUrl
+  || (explicitPublicUrl.startsWith('wss://') || MESH_SHARED_PORT ? PUBLIC_URL : `ws://${PUBLIC_HOST}:${PEER_PORT}`);
 const STARTED_AT = Date.now();
+
+// Revisa las URLs que se anuncian en el directorio: un error ahí (p. ej.
+// "wss://https://xxx.ngrok-free.dev") deja a los jugadores sin poder entrar.
+function checkWsUrl(value, name, allowPath) {
+  let u;
+  try { u = new URL(value); } catch (_) { return `${name}=${value} no es una URL válida`; }
+  if (u.protocol !== 'ws:' && u.protocol !== 'wss:') return `${name}=${value} debe empezar con ws:// o wss://`;
+  if (!u.hostname || /^https?$/i.test(u.hostname) || value.indexOf('://') !== value.lastIndexOf('://')) {
+    return `${name}=${value} tiene el protocolo repetido o no tiene host (ejemplo correcto: wss://xxx.ngrok-free.dev)`;
+  }
+  if (!allowPath && u.pathname !== '/' && u.pathname !== '') return `${name}=${value} no debe tener ruta (el cliente le agrega /connect)`;
+  return null;
+}
+for (const problem of [checkWsUrl(PUBLIC_URL, 'PUBLIC_URL', false), checkWsUrl(PEER_URL, 'PEER_URL', true)]) {
+  if (problem) { console.error(`Configuración inválida: ${problem}`); process.exit(1); }
+}
+if (process.env.AUTH_URL && /localhost|127\.0\.0\.1/.test(PEER_URL) && !/localhost|127\.0\.0\.1/.test(process.env.AUTH_URL)) {
+  console.warn(`Aviso: PEER_URL=${PEER_URL} apunta a localhost pero el directorio está en otro equipo: los coordinadores de otros equipos no podrán conectarse a este. Configurar PUBLIC_HOST (IP LAN) o PEER_URL.`);
+}
 const JWT_SECRET = process.env.JWT_SECRET;
 const HEARTBEAT_MS = parseInt(process.env.HEARTBEAT_MS || '30000', 10);
 // Auth y coordinador corren en equipos distintos: sus relojes no son idénticos.
@@ -547,6 +572,10 @@ server.on('upgrade', (req, socket, head) => {
   const token = searchParams.get('token');
 
   if (pathname !== '/connect') {
+    // Mesh por el mismo puerto que los jugadores: los otros coordinadores
+    // entran por la raíz o por /mesh (así sirve un peerUrl que sea solo el
+    // dominio del túnel, p. ej. wss://xxx.ngrok-free.dev). Los jugadores
+    // siempre usan /connect.
     if (mesh && (pathname === '/' || pathname === '/mesh')) {
       mesh.handleUpgrade(req, socket, head);
       return;
@@ -801,8 +830,16 @@ function onPeerMessage(msg, peerId) {
       for (const s of msg.players) {
         const q = s && players.get(String(s.userId));
         if (!q || q.owner !== peerId || !isFiniteNum(s.x) || !isFiniteNum(s.y)) continue;
-        q.x = clampX(s.x);
-        q.y = clampY(s.y);
+        // Corrección suave: la copia ya viene avanzando con el intent replicado,
+        // así que la diferencia suele ser de pocos px. Saltar de golpe a la
+        // posición del dueño hacía que los autos remotos "tironearan"; se
+        // acerca un 35 % por sync en movimiento (60 % si está quieto, para
+        // que quede en el lugar exacto enseguida) y solo se salta si la
+        // diferencia es grande.
+        const tx = clampX(s.x), ty = clampY(s.y);
+        const err = Math.hypot(tx - q.x, ty - q.y);
+        const k = q.intent.x || q.intent.y ? 0.35 : 0.6;
+        if (err > 3 * PLAYER_RADIUS) { q.x = tx; q.y = ty; } else { q.x += (tx - q.x) * k; q.y += (ty - q.y) * k; }
         if (isFiniteNum(s.angle)) q.angle = s.angle;
       }
       return;
@@ -867,7 +904,7 @@ function onPeerDown(peerId) {
 
 if (AUTH_URL && (process.env.MESH || 'on').trim().toLowerCase() !== 'off') {
   mesh = createMesh({
-    id: COORDINATOR_ID, peerPort: PEER_PORT, publicUrl: PUBLIC_URL, peerUrl: PEER_URL,
+    id: COORDINATOR_ID, peerPort: MESH_SHARED_PORT ? null : PEER_PORT, publicUrl: PUBLIC_URL, peerUrl: PEER_URL,
     authUrl: AUTH_URL, secret: JWT_SECRET, startedAt: STARTED_AT,
     getConnectedPlayers: localCount,
     onMessage: onPeerMessage, onPeerUp, onPeerDown,

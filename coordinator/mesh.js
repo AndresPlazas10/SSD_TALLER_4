@@ -89,9 +89,13 @@ function createMesh({ id, peerPort, publicUrl, peerUrl, authUrl, secret, started
       register(ok.peerId, ok.startedAt, ws);
     });
   }
-  const server = new WebSocketServer({ port: peerPort, maxPayload: MAX_PEER_MESSAGE_BYTES });
-  server.on('connection', onIncoming);
-  server.on('error', (err) => console.error(`[mesh] no se pudo escuchar en ${peerPort}: ${err.message}`));
+  // peerPort null = mesh por el mismo puerto que los jugadores (PEER_PORT =
+  // PORT): no se abre un puerto aparte; solo entra por handleUpgrade.
+  const server = peerPort ? new WebSocketServer({ port: peerPort, maxPayload: MAX_PEER_MESSAGE_BYTES }) : null;
+  if (server) {
+    server.on('connection', onIncoming);
+    server.on('error', (err) => console.error(`[mesh] no se pudo escuchar en ${peerPort}: ${err.message}`));
+  }
   const upgradeServer = new WebSocketServer({ noServer: true, maxPayload: MAX_PEER_MESSAGE_BYTES });
   function handleUpgrade(req, socket, head) {
     upgradeServer.handleUpgrade(req, socket, head, onIncoming);
@@ -136,7 +140,11 @@ function createMesh({ id, peerPort, publicUrl, peerUrl, authUrl, secret, started
           uptime: Math.round((Date.now() - startedAt) / 1000),
         }),
       });
-      if (!hb.ok) throw new Error(`heartbeat HTTP ${hb.status}`);
+      if (!hb.ok) {
+        let detail = '';
+        try { detail = (await hb.json()).error || ''; } catch (_) {}
+        throw new Error(`heartbeat HTTP ${hb.status}${detail ? `: ${detail}` : ''}`);
+      }
       const res = await fetch(`${authUrl}/peers`, { headers, signal: AbortSignal.timeout(4500) });
       if (!res.ok) throw new Error(`peers HTTP ${res.status}`);
       const body = await res.json();
@@ -187,7 +195,8 @@ function createMesh({ id, peerPort, publicUrl, peerUrl, authUrl, secret, started
     clearInterval(dirTimer);
     clearInterval(pingTimer);
     for (const { ws } of peers.values()) ws.terminate();
-    server.close();
+    if (server) server.close();
+    upgradeServer.close();
   }
 
   return {

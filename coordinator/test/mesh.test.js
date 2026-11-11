@@ -12,6 +12,10 @@ const crypto = require('node:crypto');
 const jwt = require('jsonwebtoken');
 const WebSocket = require('ws');
 
+// Los coordinadores de prueba no deben heredar la configuración de despliegue
+// del .env de desarrollo (URLs de ngrok, id, puertos del mesh): vacías = valores
+// por defecto (dotenv no pisa variables que ya existen, aunque estén vacías)
+Object.assign(process.env, { PUBLIC_URL: '', PEER_URL: '', PUBLIC_HOST: '', COORDINATOR_ID: '', PEER_PORT: '' });
 const JWT_SECRET = crypto.randomBytes(32).toString('hex');
 const BASE = 7000 + Math.floor(Math.random() * 400) * 4;
 const AUTH_PORT = BASE;
@@ -208,4 +212,53 @@ test('5. cae coord-b: sus clientes se desconectan, el auth deja de devolverlo y 
   await alice.waitFor((m) => m.type === 'state' && find(m, 2), 5000);
   alice.close(); bob2.close();
   await Promise.all([alice.closed, bob2.closed]);
+});
+
+test('6. coordinador con el mesh por el MISMO puerto (/mesh, como con un solo túnel de ngrok) se une al mesh', async () => {
+  const port = BASE + 3 + 1; // libre: el de coord-c + 1
+  procs['coord-d'] = await startProc(['index.js', '--id', 'coord-d', '--port', String(port), '--peer-port', String(port)],
+    path.join(__dirname, '..'), {
+      JWT_SECRET, AUTH_URL: AUTH, PUBLIC_HOST: '127.0.0.1', SESSION_MAX_AGE: '', OBSTACLES: 'off',
+      WORLD_WIDTH: '400', WORLD_HEIGHT: '300', MATCH_SECONDS: '600', TOKEN_POLICY_POLL_MS: '60000',
+    }, /Coordinador en puerto/);
+  const peers = await waitFor(async () => {
+    const h = await getJson(`http://127.0.0.1:${port}/health`);
+    return h.data.peers.length === 2 ? h.data.peers.sort() : null;
+  });
+  assert.deepStrictEqual(peers, ['coord-a', 'coord-c']);
+  const listed = (await getJson(`${AUTH}/peers`, { headers: { Authorization: `Bearer ${coordToken()}` } })).data.peers;
+  assert.strictEqual(listed.find((p) => p.coordinatorId === 'coord-d').peerUrl, `ws://127.0.0.1:${port}`); // misma URL que los jugadores (el mesh entra por la raíz o /mesh)
+  // Y replica: Dana en coord-d ve a Alice (coord-a) moverse
+  const dana = client(`ws://127.0.0.1:${port}`, sign(7, 'dana'));
+  const alice = client(`ws://127.0.0.1:${COORDS['coord-a']}`, sign(1, 'alice'));
+  const a0 = await dana.waitFor((m) => m.type === 'state' && find(m, 1)).then((m) => find(m, 1));
+  alice.sendJson({ type: 'intent', intent: { dir: { x: a0.x < 200 ? 1 : -1, y: 0 } } });
+  await sleep(500);
+  assert.ok(Math.abs(find(dana.last('state'), 1).x - a0.x) > 50, 'Dana vio a Alice moverse');
+  dana.close(); alice.close();
+  await Promise.all([dana.closed, alice.closed]);
+});
+
+test('7. un coordinador con PUBLIC_URL mal escrita no arranca y explica el error', async () => {
+  const child = spawn(process.execPath, ['index.js', '--id', 'coord-x', '--port', String(BASE + 9)], {
+    cwd: path.join(__dirname, '..'),
+    env: { ...process.env, JWT_SECRET, AUTH_URL: AUTH, PUBLIC_URL: 'wss://https://spindle-overstep-pelt.ngrok-free.dev' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.on('data', (d) => { stderr += d; });
+  const code = await new Promise((r) => child.once('exit', r));
+  assert.strictEqual(code, 1);
+  assert.match(stderr, /protocolo repetido/);
+});
+
+test('8. el mesh también acepta conexiones en la raíz del puerto de jugadores (peerUrl = solo el dominio del túnel)', async () => {
+  // coord-a (puerto de jugadores) recibe un hello en "/" como si fuera un par
+  const ws = new WebSocket(`ws://127.0.0.1:${COORDS['coord-a']}/`);
+  await new Promise((r, j) => { ws.once('open', r); ws.once('error', j); });
+  ws.send(JSON.stringify({ type: 'hello', coordinatorId: 'coord-z', startedAt: Date.now(), auth: jwt.sign({ role: 'coordinator', coordinatorId: 'coord-z' }, JWT_SECRET, { expiresIn: '1m' }) }));
+  const reply = await new Promise((r) => ws.once('message', (d) => r(JSON.parse(d.toString()))));
+  assert.strictEqual(reply.type, 'hello');
+  assert.strictEqual(reply.coordinatorId, 'coord-a');
+  ws.close();
 });

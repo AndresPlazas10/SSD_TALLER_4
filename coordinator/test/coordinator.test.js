@@ -9,6 +9,10 @@ const crypto = require('node:crypto');
 const jwt = require('jsonwebtoken');
 const WebSocket = require('ws');
 
+// Los coordinadores de prueba no deben heredar la configuración de despliegue
+// del .env de desarrollo (URLs de ngrok, id, puertos del mesh): vacías = valores
+// por defecto (dotenv no pisa variables que ya existen, aunque estén vacías)
+Object.assign(process.env, { PUBLIC_URL: '', PEER_URL: '', PUBLIC_HOST: '', COORDINATOR_ID: '', PEER_PORT: '' });
 const PORT = 5600 + Math.floor(Math.random() * 300);
 const JWT_SECRET = crypto.randomBytes(32).toString('hex');
 const WORLD = { width: 400, height: 300, radius: 20, speed: 200, tick: 20 };
@@ -172,7 +176,7 @@ test('se queda dentro del mundo (clamp en los 4 bordes)', async () => {
   // (y ahora los autos chocan entre sí)
   await ws.waitFor((m) => m.type === 'state' && m.players.length === 1, 3000);
   ws.send({ type: 'intent', intent: { dir: { x: 1, y: 1 } } });
-  await sleep(2500);
+  await sleep(3500); // el peor caso (esquina opuesta) toma ~2,2 s; margen si el equipo va cargado
   const p = me(lastState(ws), '7');
   assert.deepStrictEqual([p.x, p.y], [380, 280]);
   ws.close();
