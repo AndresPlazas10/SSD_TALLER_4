@@ -130,6 +130,13 @@ const REVERSE_FACTOR = 0.6;
 // equipo con más pasajeros y, tras MATCH_BREAK_SECONDS, empieza otra
 const MATCH_SECONDS = parseInt(process.env.MATCH_SECONDS || '180', 10);
 const MATCH_BREAK_SECONDS = parseInt(process.env.MATCH_BREAK_SECONDS || '10', 10);
+// Si se cae un coordinador, sus jugadores quedan "en espera" este tiempo (quietos,
+// con su posición, extras y puntaje) para que al reconectarse a otro
+// coordinador sigan exactamente donde estaban. Pasado el plazo, se borran.
+const ORPHAN_GRACE_MS = parseInt(process.env.ORPHAN_GRACE_MS || '15000', 10);
+// Balanceo: cada REBALANCE_MS, si este coordinador tiene 2 o más jugadores que el
+// menos cargado del mesh, le pide a uno de sus clientes que se mude.
+const REBALANCE_MS = parseInt(process.env.REBALANCE_MS || '3000', 10);
 // Límite anti-abuso: ws corta (1009) cualquier mensaje más grande que esto
 // antes de parsearlo, así nadie puede mandar 10 MB.
 const MAX_MESSAGE_BYTES = 4096;
@@ -471,6 +478,9 @@ function tick() {
     }
   }
 
+  // Jugadores de un coordinador caído que no volvieron a tiempo
+  if (mesh) expireOrphans(now);
+
   // Los autos chocan entre sí en vez de atravesarse
   separateCars();
 
@@ -625,7 +635,7 @@ wss.on('connection', (ws, payload) => {
     console.log(`[ws] ${username} ya estaba conectado: se cierra la sesión anterior`);
     existing.socket.close(4002, 'session replaced');
   } else if (existing) {
-    console.log(`[ws] ${username} venía de ${existing.owner}: la sesión pasa a este coordinador`);
+    console.log(`[ws] ${username} venía de ${existing.owner || "un coordinador caído"}: sigue aquí donde estaba (posición y puntaje)`);
   }
 
   // Aparece en la calle, nunca dentro de una estructura
@@ -734,6 +744,7 @@ wss.on('close', () => {
   clearTimeout(gameLoop);
   fs.unwatchFile(ENV_FILE, reloadSessionMaxAge);
   clearInterval(policyTimer);
+  clearInterval(rebalanceTimer);
 });
 
 // ===================== Mesh (Taller 6) =====================
@@ -890,19 +901,64 @@ function onPeerUp(peerId) {
 }
 
 function onPeerDown(peerId) {
-  // Se cayó un coordinador: sus jugadores se desconectaron (se reconectan a
-  // otro coordinador y vuelven a aparecer con su player_joined)
+  // Se cayó un coordinador: sus jugadores NO se borran. Quedan en espera
+  // (owner = null) con su posición, extras y puntaje durante ORPHAN_GRACE_MS:
+  // sus clientes se reconectan solos a otro coordinador y ahí siguen donde
+  // estaban (la conexión nueva hereda esta copia), sin teletransportarse ni
+  // perder sus pasajeros. Si no vuelven en el plazo, expireOrphans los borra.
+  let orphaned = 0;
+  const now = Date.now();
+  for (const p of players.values()) {
+    if (p.owner === peerId) {
+      p.owner = null;
+      p.orphanSince = now;
+      p.intent = { x: 0, y: 0 }; // quieto mientras se reconecta
+      orphaned++;
+    }
+  }
+  if (orphaned) console.log(`[mesh] ${orphaned} jugador(es) de ${peerId} en espera de reconexión (${ORPHAN_GRACE_MS / 1000} s)`);
+}
+
+function expireOrphans(now) {
   let removed = 0;
   for (const [userId, p] of players) {
-    if (p.owner === peerId) { players.delete(userId); removed++; }
+    if (p.owner === null && now - p.orphanSince > ORPHAN_GRACE_MS) { players.delete(userId); removed++; }
   }
   if (removed) {
-    console.log(`[mesh] ${removed} jugador(es) de ${peerId} quedaron desconectados`);
+    console.log(`[mesh] ${removed} jugador(es) no volvieron a conectarse: se borran`);
     broadcastPlayers();
   }
 }
 
+// Balanceo de carga entre coordinadores. La carga de cada uno se sabe por el
+// mesh (owner de cada jugador). Si este tiene 2 o más jugadores que el menos
+// cargado, le pide a UNO de sus clientes que se mude ({ type: 'migrate' }). El
+// cliente pide otro coordinador al directorio y se conecta ANTES de soltar
+// este (la sesión nueva hereda posición y puntaje y este cierra la vieja con
+// 4002): no hay corte. Uno por ciclo y nunca el mismo cliente dos veces en
+// 15 s, para no rebotar jugadores de un lado a otro.
+function rebalance() {
+  if (!mesh) return;
+  const peerIds = mesh.peerIds();
+  if (!peerIds.length) return;
+  const load = new Map([[COORDINATOR_ID, 0], ...peerIds.map((id) => [id, 0])]);
+  for (const p of players.values()) if (load.has(p.owner)) load.set(p.owner, load.get(p.owner) + 1);
+  const mine = load.get(COORDINATOR_ID);
+  const min = Math.min(...load.values());
+  if (mine - min < 2) return;
+  const now = Date.now();
+  const candidate = Array.from(players.values())
+    .filter((p) => isLocal(p) && p.socket.readyState === p.socket.OPEN && !(now - (p.migrateAskedAt || 0) < 15000))
+    .sort((a, b) => (a.connectedAt < b.connectedAt ? 1 : -1))[0]; // el que llegó último
+  if (!candidate) return;
+  candidate.migrateAskedAt = now;
+  console.log(`[balanceo] ${COORDINATOR_ID} tiene ${mine} y el menos cargado ${min}: ${candidate.username} se muda`);
+  candidate.socket.send(JSON.stringify({ type: 'migrate', reason: 'balance' }));
+}
+
+let rebalanceTimer = null;
 if (AUTH_URL && (process.env.MESH || 'on').trim().toLowerCase() !== 'off') {
+  rebalanceTimer = setInterval(rebalance, REBALANCE_MS);
   mesh = createMesh({
     id: COORDINATOR_ID, peerPort: MESH_SHARED_PORT ? null : PEER_PORT, publicUrl: PUBLIC_URL, peerUrl: PEER_URL,
     authUrl: AUTH_URL, secret: JWT_SECRET, startedAt: STARTED_AT,

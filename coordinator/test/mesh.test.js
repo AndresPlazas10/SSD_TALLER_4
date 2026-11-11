@@ -182,20 +182,48 @@ test('4. la misma cuenta abierta en otro coordinador cierra la sesión anterior 
   await Promise.all([second.closed, watcher.closed]);
 });
 
-test('5. cae coord-b: sus clientes se desconectan, el auth deja de devolverlo y se reconectan a los vivos', async () => {
+// Maneja al jugador `id` hacia el pasajero hasta que tenga al menos `goal` puntos
+async function driveToPassenger(ws, id, goal = 1, ms = 8000) {
+  const t0 = Date.now();
+  let lastDir = '';
+  while (Date.now() - t0 < ms) {
+    const s = ws.last('state');
+    const p = s && find(s, id);
+    if (p && p.score >= goal) break;
+    if (p && s.passenger) {
+      const dir = { x: Math.sign(Math.round(s.passenger.x - p.x)), y: Math.sign(Math.round(s.passenger.y - p.y)) };
+      if (JSON.stringify(dir) !== lastDir) { ws.sendJson({ type: 'intent', intent: { dir } }); lastDir = JSON.stringify(dir); }
+    }
+    await sleep(25);
+  }
+  ws.sendJson({ type: 'intent', intent: { dir: { x: 0, y: 0 } } });
+}
+
+test('5. cae coord-b: su jugador no se teletransporta ni pierde puntos, el auth deja de devolverlo y se reconecta a uno vivo', async () => {
   const alice = client(`ws://127.0.0.1:${COORDS['coord-a']}`, sign(1, 'alice'));
   const bob = client(`ws://127.0.0.1:${COORDS['coord-b']}`, sign(2, 'bob', 'uber'));
   await alice.waitFor((m) => m.type === 'state' && find(m, 2));
+  await bob.waitFor((m) => m.type === 'state' && find(m, 2));
+  // Bob gana al menos un pasajero antes de la caída
+  await driveToPassenger(bob, 2, 1);
+  await sleep(700); // que se quede quieto y su posición se sincronice
+  const before = find(bob.last('state'), 2);
+  assert.ok(before.score >= 1, `Bob tiene ${before.score} pasajeros`);
 
   // "Ctrl+C" a coord-b
   await stopProc(procs['coord-b']);
   const closed = await bob.closed;
   assert.notStrictEqual(closed.code, 4001); // se cortó la conexión, no fue un rechazo de token
-  // Alice deja de ver a Bob (coord-a se enteró de la caída por el mesh)
-  await alice.waitFor((m) => m.type === 'state' && !find(m, 2), 5000);
+
+  // Alice lo sigue viendo, quieto en el mismo lugar y con sus puntos (en espera)
+  await sleep(1000);
+  const parked = find(alice.last('state'), 2);
+  assert.ok(parked, 'Bob sigue en el mundo mientras se reconecta');
+  assert.ok(Math.hypot(parked.x - before.x, parked.y - before.y) < 2, `Bob quedó donde estaba (${parked.x},${parked.y} vs ${before.x},${before.y})`);
+  assert.strictEqual(parked.score, before.score);
 
   // Pasado el TTL sin heartbeat, el auth ya no devuelve a coord-b
-  await sleep(TTL + 500);
+  await sleep(TTL);
   for (let i = 0; i < 6; i++) {
     const { status, data } = await getJson(`${AUTH}/coordinator`);
     assert.strictEqual(status, 200);
@@ -204,12 +232,15 @@ test('5. cae coord-b: sus clientes se desconectan, el auth deja de devolverlo y 
   const peers = (await getJson(`${AUTH}/peers`, { headers: { Authorization: `Bearer ${coordToken()}` } })).data.peers;
   assert.deepStrictEqual(peers.map((p) => p.coordinatorId).sort(), ['coord-a', 'coord-c']);
 
-  // Bob pide coordinador de nuevo y se reconecta a uno vivo; Alice lo vuelve a ver
+  // Bob pide coordinador de nuevo y se reconecta a uno vivo: sigue donde estaba
+  // y con sus pasajeros (no se teletransporta ni arranca en 0)
   const { data } = await getJson(`${AUTH}/coordinator`);
   const bob2 = client(data.publicUrl, sign(2, 'bob', 'uber'));
   const w = await bob2.waitFor((m) => m.type === 'welcome');
   assert.ok(['coord-a', 'coord-c'].includes(w.coordinator.id));
-  await alice.waitFor((m) => m.type === 'state' && find(m, 2), 5000);
+  const after = await bob2.waitFor((m) => m.type === 'state' && find(m, 2)).then((m) => find(m, 2));
+  assert.ok(Math.hypot(after.x - before.x, after.y - before.y) < 2, `sin teletransporte (${after.x},${after.y} vs ${before.x},${before.y})`);
+  assert.strictEqual(after.score, before.score, 'conserva sus pasajeros');
   alice.close(); bob2.close();
   await Promise.all([alice.closed, bob2.closed]);
 });
@@ -261,4 +292,25 @@ test('8. el mesh también acepta conexiones en la raíz del puerto de jugadores 
   assert.strictEqual(reply.type, 'hello');
   assert.strictEqual(reply.coordinatorId, 'coord-a');
   ws.close();
+});
+
+test('9. balanceo: un coordinador sobrecargado muda clientes al menos cargado, sin perder posición ni puntaje', async () => {
+  // Tres jugadores entran directo a coord-a (sin pasar por el directorio):
+  // coord-a = 3, coord-c = 0, coord-d = 0
+  const ws = [11, 12, 13].map((id) => client(`ws://127.0.0.1:${COORDS['coord-a']}`, sign(id, `bal${id}`)));
+  for (const c of ws) await c.waitFor((m) => m.type === 'welcome');
+  // coord-a le pide a uno que se mude (el balanceo corre cada 3 s)
+  const asked = await waitFor(() => ws.find((c) => c.msgs.some((m) => m.type === 'migrate')), 8000, 50);
+  const id = [11, 12, 13][ws.indexOf(asked)];
+  const before = find(asked.last('state'), id);
+  // El cliente hace lo mismo que el navegador: pide otro coordinador y se conecta
+  const { data } = await getJson(`${AUTH}/coordinator?exclude=coord-a`);
+  assert.notStrictEqual(data.coordinatorId, 'coord-a');
+  const moved = client(data.publicUrl, sign(id, `bal${id}`));
+  assert.strictEqual((await moved.waitFor((m) => m.type === 'welcome')).coordinator.id, data.coordinatorId);
+  assert.strictEqual((await asked.closed).code, 4002, 'coord-a suelta la conexión vieja');
+  const after = await moved.waitFor((m) => m.type === 'state' && find(m, id)).then((m) => find(m, id));
+  assert.ok(Math.hypot(after.x - before.x, after.y - before.y) < 25, 'sigue donde estaba');
+  assert.strictEqual(after.score, before.score);
+  for (const c of [...ws.filter((c) => c !== asked), moved]) { c.close(); await c.closed; }
 });
