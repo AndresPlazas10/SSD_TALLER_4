@@ -76,6 +76,15 @@ test('POST /heartbeat valida el body -> 400', async () => {
   assert.strictEqual((await heartbeat('coord-a', 1.5)).status, 400);
   assert.strictEqual((await heartbeat('coord-a', 0, { uptime: 'mucho' })).status, 400);
   assert.strictEqual((await heartbeat('mal id!', 0, {}, coordToken('mal id!'))).status, 401);
+  // Errores típicos de configuración con ngrok
+  const dup = await heartbeat('coord-a', 0, { publicUrl: 'wss://https://spindle-overstep-pelt.ngrok-free.dev' });
+  assert.strictEqual(dup.status, 400);
+  assert.match(dup.data.error, /protocolo repetido/);
+  const withPath = await heartbeat('coord-a', 0, { publicUrl: 'wss://x.ngrok-free.dev/task/capabilities' });
+  assert.strictEqual(withPath.status, 400);
+  assert.match(withPath.data.error, /no debe tener ruta/);
+  // peerUrl sí puede tener ruta (mesh por el mismo puerto: /mesh)
+  assert.strictEqual((await heartbeat('coord-a', 0, { publicUrl: 'wss://x.ngrok-free.dev', peerUrl: 'wss://x.ngrok-free.dev/mesh' })).status, 200);
 });
 
 test('GET /coordinator: el de menos connectedPlayers; en empate el primero', async () => {

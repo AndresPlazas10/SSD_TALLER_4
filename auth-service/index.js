@@ -388,7 +388,21 @@ app.get('/token-policy', (req, res) => {
 // anunciar en su siguiente heartbeat (2 s).
 const DIRECTORY_TTL_MS = parseInt(process.env.DIRECTORY_TTL_MS || '6000', 10); // 3 ciclos de 2 s
 const COORD_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
-const WS_URL_RE = /^wss?:\/\/[^\s]{1,250}$/;
+
+// URL ws:// o wss:// bien formada. Atrapa errores típicos de configuración,
+// como "wss://https://xxx.ngrok-free.dev" (protocolo repetido). Para publicUrl
+// no se admite ruta: el cliente le agrega /connect.
+function wsUrlError(value, name, allowPath) {
+  if (typeof value !== 'string' || value.length > 250) return `${name} debe ser un texto de hasta 250 caracteres`;
+  let u;
+  try { u = new URL(value); } catch (_) { return `${name} no es una URL válida: ${value}`; }
+  if (u.protocol !== 'ws:' && u.protocol !== 'wss:') return `${name} debe empezar con ws:// o wss:// (llegó ${value})`;
+  if (!u.hostname || /^https?$/i.test(u.hostname) || value.indexOf('://') !== value.lastIndexOf('://')) {
+    return `${name} tiene el protocolo repetido o sin host (llegó ${value}; p. ej. wss://xxx.ngrok-free.dev)`;
+  }
+  if (!allowPath && u.pathname !== '/' && u.pathname !== '') return `${name} no debe tener ruta (llegó ${value}; el cliente agrega /connect)`;
+  return null;
+}
 
 // coordinatorId -> { coordinatorId, publicUrl, peerUrl, connectedPlayers, uptime, lastSeen, assigned }
 const coordinators = new Map();
@@ -430,8 +444,8 @@ app.post('/heartbeat', requireCoordinator, (req, res) => {
   }
   // Un coordinador solo puede anunciarse a sí mismo
   if (coordinatorId !== req.coordinatorId) return res.status(403).json({ error: 'coordinatorId no coincide con el token' });
-  if (typeof publicUrl !== 'string' || !WS_URL_RE.test(publicUrl)) return res.status(400).json({ error: 'publicUrl debe ser ws:// o wss://' });
-  if (typeof peerUrl !== 'string' || !WS_URL_RE.test(peerUrl)) return res.status(400).json({ error: 'peerUrl debe ser ws:// o wss://' });
+  const urlError = wsUrlError(publicUrl, 'publicUrl', false) || wsUrlError(peerUrl, 'peerUrl', true);
+  if (urlError) return res.status(400).json({ error: urlError });
   if (!Number.isInteger(connectedPlayers) || connectedPlayers < 0) return res.status(400).json({ error: 'connectedPlayers debe ser un entero >= 0' });
   if (typeof uptime !== 'number' || !(uptime >= 0)) return res.status(400).json({ error: 'uptime debe ser un número >= 0' });
 
