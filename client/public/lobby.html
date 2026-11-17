@@ -21,6 +21,7 @@
     </div>
     <span class="logo"><span class="l-uber">UBER</span><span class="l-vs">vs</span><span class="l-taxi">TAXI</span></span>
     <div class="nav-right">
+      <span id="spectator-badge" class="spectator-badge" hidden>👀 MODO ESPECTADOR</span>
       <button type="button" id="logout" class="nav-btn danger">Cerrar sesión</button>
     </div>
   </nav>
@@ -40,8 +41,12 @@
           <button type="button" id="fullscreen" class="stage-btn" title="Pantalla completa (F)">⛶ Pantalla completa</button>
           <!-- A qué coordinador del mesh está conectado este cliente -->
           <span id="coord-chip" class="stage-chip" hidden></span>
+          <!-- Y a qué auth replicado (Taller 7) le pidió el coordinador -->
+          <span id="auth-chip" class="stage-chip"></span>
         </div>
         <div id="teams-hud" class="teams-hud" hidden></div>
+        <!-- Examen final (track 2.5): cartel fijo del modo espectador -->
+        <div id="spectator-banner" class="spectator-banner" hidden>👀 MODO ESPECTADOR · solo mirar, sin controles · clic en un conductor para seguirlo</div>
         <div id="toast" class="toast-3d" role="status" hidden></div>
         <!-- Partida Uber vs Taxi: ronda y tiempo, y el cartel del ganador -->
         <div id="match-hud" class="match-hud" hidden></div>
@@ -66,7 +71,7 @@
 
     <aside class="side-panel">
       <!-- Feature extra replicado: color del auto + mood (viajan en extras) -->
-      <section class="card">
+      <section class="card" id="extras-card">
         <h2>🎨 Tu auto</h2>
         <p class="hint">Todos ven tu color y tu mood en vivo.</p>
         <label>Color</label>
@@ -84,19 +89,39 @@
         <ul id="players"></ul>
         <p class="empty hidden" id="empty">Esperando conductores…</p>
       </section>
+
+      <!-- Examen final (track 2.6): chat distribuido entre coordinadores -->
+      <section class="card chat-card">
+        <div class="lobby-head">
+          <h2>💬 Chat</h2>
+          <span class="hint" title="El líder del mesh numera cada mensaje: todos los ven en el mismo orden">orden global</span>
+        </div>
+        <ol id="chat-log" class="chat-log" aria-live="polite"></ol>
+        <form id="chat-form" class="chat-form" autocomplete="off">
+          <input id="chat-input" maxlength="200" placeholder="Escribe y Enter…" aria-label="Mensaje de chat" />
+          <button type="submit">Enviar</button>
+        </form>
+        <p class="hint chat-status" id="chat-status"></p>
+      </section>
     </aside>
   </main>
 
-  <!-- AUTH_URL (y COORDINATOR_WS de respaldo) vienen del .env del cliente (server.js los sirve como /config.js) -->
+  <!-- AUTH_URLS (y COORDINATOR_WS de respaldo) vienen del .env del cliente (server.js los sirve como /config.js) -->
   <!-- Three.js lo sirve el propio cliente (client/server.js -> node_modules) -->
   <script src="vendor/three.min.js"></script>
   <script src="config.js"></script>
+  <script src="auth-client.js"></script>
   <script>
     const token = localStorage.getItem('token');
     const username = localStorage.getItem('username') || '';
-    // AUTH_URL: el auth también es el directorio de coordinadores (Taller 6).
+    // AUTH_URLS: los auth (replicados, Taller 7) son también el directorio de
+    // coordinadores (Taller 6); auth-client.js prueba el siguiente si uno cae.
     // COORDINATOR_WS solo se usa si el auth no tiene directorio (Taller 5).
-    const { AUTH_URL, COORDINATOR_WS } = window.APP_CONFIG;
+    const { COORDINATOR_WS } = window.APP_CONFIG;
+    // Examen final (track 2.5): lobby.html?spectate abre el juego como
+    // espectador: sin login, sin controles, solo mirar (y leer el chat)
+    const SPECTATOR = new URLSearchParams(window.location.search).has('spectate');
+    let followId = null; // espectador: conductor al que sigue la cámara
 
     // Último 'state' recibido del servidor. Es lo único que se dibuja.
     // Modificarlo desde DevTools solo cambia ESTA pantalla: el servidor es la
@@ -222,6 +247,16 @@
         score.title = 'Pasajeros recogidos';
         li.dataset.userId = String(p.userId);
         li.append(avatarFor(p.username), text, score);
+        if (SPECTATOR) {
+          li.classList.add('followable');
+          li.title = 'Seguir a este conductor';
+          if (String(p.userId) === followId) li.classList.add('is-followed');
+          li.addEventListener('click', () => {
+            followId = String(p.userId);
+            setCameraMode('seguir');
+            for (const x of ul.querySelectorAll('li')) x.classList.toggle('is-followed', x === li);
+          });
+        }
         if (String(p.userId) === myUserId) {
           li.classList.add('is-me');
           const me = document.createElement('span');
@@ -260,10 +295,10 @@
     let viewSize = { w: 800, h: 600 };
     const camTarget = newVector();
     // Por defecto la cámara sigue a mi auto (la ciudad es grande)
-    let cameraMode = 'seguir';
+    let cameraMode = SPECTATOR ? 'ciudad' : 'seguir';
     try {
       const saved = localStorage.getItem('camera-mode');
-      if (saved === 'ciudad' || saved === 'seguir' || saved === 'primera') cameraMode = saved;
+      if (!SPECTATOR && (saved === 'ciudad' || saved === 'seguir' || saved === 'primera')) cameraMode = saved;
     } catch (_) {}
 
     // Si Three.js no cargó, THREE no existe: esto evita un error al declarar
@@ -1072,14 +1107,19 @@
     function setCameraMode(mode) {
       const prevMode = cameraMode;
       cameraMode = mode;
-      cameraBtn.textContent = CAMERA_LABELS[mode];
-      try { localStorage.setItem('camera-mode', mode); } catch (_) {}
+      cameraBtn.textContent = SPECTATOR && mode === 'seguir' ? '🎥 Seguir al conductor' : CAMERA_LABELS[mode];
+      if (!SPECTATOR) { try { localStorage.setItem('camera-mode', mode); } catch (_) {} }
       if (mode === 'primera' && prevMode !== 'primera') {
         // Arranca mirando hacia donde apunta el auto
         driveHeading = headingFromAngle(myAngle);
         fpYaw = driveHeading * (Math.PI / 4);
       }
       keysHint.textContent = '';
+      if (SPECTATOR) {
+        keysHint.textContent = 'Modo espectador: miras la partida sin manejar. Clic en un conductor de la lista para seguirlo · C cambia la cámara';
+        applyModeLook();
+        return;
+      }
       const hint = mode === 'primera'
         ? [['W', ' acelera · '], ['S', ' reversa · '], ['A', ''], ['D', ' giran · recoge al pasajero 🙋']]
         : [['W', ''], ['A', ''], ['S', ''], ['D', ' o las flechas · recoge al pasajero 🙋 antes que los demás']];
@@ -1093,7 +1133,9 @@
       if (onCameraModeChange) onCameraModeChange();
     }
     cameraBtn.addEventListener('click', () => {
-      setCameraMode(CAMERA_MODES[(CAMERA_MODES.indexOf(cameraMode) + 1) % CAMERA_MODES.length]);
+      // El espectador no maneja: no tiene vista desde la cabina
+      const modes = SPECTATOR ? ['ciudad', 'seguir'] : CAMERA_MODES;
+      setCameraMode(modes[(modes.indexOf(cameraMode) + 1) % modes.length]);
       cameraBtn.blur(); // que la barra espaciadora/Enter no vuelvan a cambiar el modo
     });
     setCameraMode(cameraMode);
@@ -1268,6 +1310,7 @@
               fpYaw = driveHeading * (Math.PI / 4);
             }
           }
+          if (SPECTATOR && id === followId) myPos = { x, y };
           updateLabel(car, p, isMe);
           if (insideMe) car.label.style.display = 'none';
           else placeLabel(car.label, x, y, 34);
@@ -1369,10 +1412,22 @@
       if (event.persisted) window.location.reload();
     });
 
-    if (!token) {
+    if (!token && !SPECTATOR) {
       window.location.href = 'login.html';
     } else {
-      document.getElementById('me').textContent = username;
+      document.getElementById('me').textContent = SPECTATOR ? 'Espectador' : username;
+      if (SPECTATOR) {
+        document.body.classList.add('spectator');
+        document.getElementById('spectator-badge').hidden = false;
+        document.getElementById('spectator-banner').hidden = false;
+        document.getElementById('extras-card').hidden = true;
+        document.getElementById('chat-form').hidden = true;
+        document.getElementById('chat-status').textContent = 'Los espectadores leen el chat pero no pueden escribir.';
+        document.title = 'Uber vs Taxi · Espectador';
+        const btn = document.getElementById('logout');
+        btn.textContent = 'Iniciar sesión para jugar';
+        btn.classList.remove('danger');
+      }
       const initialAvatar = avatarFor(username);
       initialAvatar.id = 'my-avatar';
       document.getElementById('my-avatar').replaceWith(initialAvatar);
@@ -1383,8 +1438,14 @@
       let ws = null;
 
       function send(obj) {
+        // El espectador no manda nada (y si lo forzara desde DevTools, el
+        // coordinador lo ignora: ver track 2.5 en el README)
+        if (SPECTATOR) return;
         if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
       }
+      // Para la demo del espectador: en DevTools, gameSocket es el WebSocket
+      // abierto; gameSocket.send(JSON.stringify({ type: 'intent', intent: { dir: { x: 1, y: 0 } } }))
+      Object.defineProperty(window, 'gameSocket', { get: () => ws });
 
       // extras_update manda el objeto completo: el servidor reemplaza player.extras
       function sendExtras(patch) {
@@ -1395,8 +1456,10 @@
         send({ type: 'extras_update', extras: myExtras });
         markSelected();
       }
-      buildControls(sendExtras);
-      markSelected();
+      if (!SPECTATOR) {
+        buildControls(sendExtras);
+        markSelected();
+      }
 
       // ---------- Input: el cliente solo manda INTENCIONES ----------
       const KEYMAP = {
@@ -1489,6 +1552,17 @@
       // coordinador conectarse: devuelve el menos cargado. Si el WS se cae, NO
       // se vuelve directo al mismo: se pregunta otra vez, excluyendo el caído.
       const coordChip = document.getElementById('coord-chip');
+      const authChip = document.getElementById('auth-chip');
+      AuthClient.onChange((i) => {
+        authChip.textContent = AuthClient.label(i);
+        authChip.title = `Auth replicados: ${AuthClient.urls().join(', ')}`;
+      });
+      // El juego no necesita al auth (el token ya está validado), pero el
+      // indicador sí: un /health liviano cada 4 s muestra si cayó el auth de
+      // turno y cuál atiende ahora (líder o réplica)
+      setInterval(() => {
+        if (!document.hidden) AuthClient.request('/health', { waitLeaderMs: 0, timeoutMs: 3000 }).catch(() => {});
+      }, 4000);
       let reconnectTimer = null;
       let connectAttempt = 0;
       let lastMsgAt = 0;        // último mensaje del coordinador (watchdog)
@@ -1502,13 +1576,17 @@
       }
 
       async function pickCoordinator(exclude) {
-        const url = `${AUTH_URL}/coordinator${exclude ? `?exclude=${encodeURIComponent(exclude)}` : ''}`;
-        const res = await fetch(url, { headers: { 'ngrok-skip-browser-warning': 'true' } });
+        // Cualquier auth (líder o réplica) contesta el directorio; si uno no
+        // responde se prueba el siguiente. Los reintentos los hace connect().
+        // Los espectadores se reparten aparte (por cantidad de espectadores)
+        const qs = new URLSearchParams();
+        if (SPECTATOR) qs.set('role', 'spectator');
+        if (exclude) qs.set('exclude', exclude);
+        const path = `/coordinator${qs.toString() ? `?${qs}` : ''}`;
+        const { status: code, data } = await AuthClient.request(path, { waitLeaderMs: 0, timeoutMs: 4000 });
         // Auth del Taller 5 (sin directorio): un solo coordinador fijo
-        if (res.status === 404 && COORDINATOR_WS) return { coordinatorId: null, publicUrl: COORDINATOR_WS };
-        let data = {};
-        try { data = await res.json(); } catch (_) {}
-        if (!res.ok || typeof data.publicUrl !== 'string') throw new Error(data.error || `HTTP ${res.status}`);
+        if (code === 404 && COORDINATOR_WS) return { coordinatorId: null, publicUrl: COORDINATOR_WS };
+        if (code !== 200 || typeof data.publicUrl !== 'string') throw new Error(data.error || `HTTP ${code}`);
         return data;
       }
 
@@ -1537,7 +1615,8 @@
         // new WebSocket() lanzaría error en vez de dejar que el coordinador lo rechace.
         let sock;
         try {
-          sock = new WebSocket(`${target.publicUrl}/connect?token=${encodeURIComponent(currentToken)}`);
+          sock = new WebSocket(SPECTATOR ? `${target.publicUrl}/spectate`
+            : `${target.publicUrl}/connect?token=${encodeURIComponent(currentToken)}`);
         } catch (err) {
           // publicUrl inválida (coordinador mal configurado, p. ej. "wss://https://..."):
           // no trabar la página; probar otro coordinador
@@ -1564,10 +1643,12 @@
           const msg = JSON.parse(event.data);
           if (msg.type === 'welcome') {
             world = msg.world;
-            myUserId = String(msg.you.userId);
+            myUserId = msg.you ? String(msg.you.userId) : null;
             // El coordinador confirma quién es (el que dijo el directorio)
             if (msg.coordinator && msg.coordinator.id) sock.coordinatorId = msg.coordinator.id;
-            coordChip.textContent = `🖧 Coordinador: ${sock.coordinatorId} · ${world.tickRate} Hz`;
+            coordChip.textContent = SPECTATOR
+              ? `🖧 Coordinador: ${sock.coordinatorId} · espectador a ${world.spectatorHz || world.tickRate} Hz`
+              : `🖧 Coordinador: ${sock.coordinatorId} · ${world.tickRate} Hz`;
             coordChip.hidden = false;
             setStatus(`En línea · ${sock.coordinatorId}`, true);
             failedTries = 0;
@@ -1584,8 +1665,11 @@
                 builtCityKey = key;
                 snapCamera();
               }
-              showRadar();
+              if (!SPECTATOR) showRadar();
             }
+            if (SPECTATOR) return; // sin auto propio: nada de controles ni extras
+            // Track 2.1: el coordinador lo recuperó de lo guardado
+            if (msg.restored) toast = { text: '💾 Volviste donde habías quedado (posición y pasajeros guardados)', mine: true, until: performance.now() + 3500 };
             // El nombre viene del JWT validado: si el token cambió de usuario, se actualiza
             document.getElementById('me').textContent = msg.you.username;
             const avatar = avatarFor(msg.you.username);
@@ -1621,6 +1705,16 @@
             // cierra la vieja. El jugador no nota nada.
             console.log(`[lobby] ${sock.coordinatorId} pide mudarse para balancear la carga`);
             connect(sock.coordinatorId, { silent: true });
+          } else if (msg.type === 'chat_history') {
+            chatHistory(msg.messages);
+          } else if (msg.type === 'chat') {
+            chatAdd(msg.message);
+          } else if (msg.type === 'chat_error') {
+            chatError(msg);
+          } else if (msg.type === 'spectator_ignored') {
+            console.log(`[lobby] el coordinador ignoró "${msg.ignored}": los espectadores son de solo lectura`);
+          } else if (msg.type === 'match_resume') {
+            toast = { text: `💾 Se reanuda la ronda ${msg.round} donde había quedado`, mine: true, until: performance.now() + 3500 };
           } else if (msg.type === 'match_start') {
             toast = { text: `🏁 ¡Empieza la ronda ${msg.round}! Recoge pasajeros para tu equipo`, mine: true, until: performance.now() + 3000 };
           } else if (msg.type === 'pickup') {
@@ -1644,7 +1738,7 @@
       // está vencido, el cierre 4001 lleva al login como siempre.
       const TOKEN_CHECK_MS = 1000;
       setInterval(() => {
-        if (loggingOut) return;
+        if (loggingOut || SPECTATOR) return;
         let stored = null;
         try { stored = localStorage.getItem('token'); } catch (_) {}
         if (stored === currentToken) return;
@@ -1671,6 +1765,14 @@
         loggingOut = true; // que el chequeo del token no actúe mientras se redirige
         // 4002: la sesión se abrió en otra pestaña. localStorage se comparte entre
         // pestañas, así que NO se borra el token: lo está usando la otra.
+        // Coordinador lleno de espectadores: probar otro enseguida
+        if (event.code === 4013) {
+          loggingOut = false;
+          ws = null;
+          console.log(`[lobby] ${sock.coordinatorId} no admite más espectadores: se prueba otro`);
+          reconnectTimer = setTimeout(() => connect(sock.coordinatorId), 300);
+          return;
+        }
         if (event.code === 4002) {
           alert('Sesión terminada: tu cuenta se abrió en otra pestaña.');
           window.location.href = 'login.html';
@@ -1728,7 +1830,72 @@
 
       connect();
 
+      // ---------- Chat (track 2.6) ----------
+      // Se dibuja SIEMPRE con textContent: un mensaje con HTML (<img onerror>)
+      // se ve como texto y nunca se ejecuta (XSS). El orden es el seq que puso
+      // el líder del mesh, no el de llegada.
+      const chatLog = document.getElementById('chat-log');
+      const chatInput = document.getElementById('chat-input');
+      const chatStatus = document.getElementById('chat-status');
+      const chatById = new Map();
+      function chatRender() {
+        const list = [...chatById.values()].sort((a, b) => a.seq - b.seq).slice(-100);
+        chatLog.textContent = '';
+        for (const m of list) {
+          const li = document.createElement('li');
+          if (String(m.userId) === myUserId) li.classList.add('mine');
+          const who = document.createElement('span');
+          who.className = `chat-who ${m.vehicle === 'uber' ? 'uber' : 'taxi'}`;
+          who.textContent = m.username;
+          const text = document.createElement('span');
+          text.className = 'chat-text';
+          text.textContent = m.text;
+          li.title = `#${m.seq} · vía ${m.origin} · numerado por ${m.orderedBy}`;
+          li.append(who, text);
+          chatLog.append(li);
+        }
+        chatLog.scrollTop = chatLog.scrollHeight;
+      }
+      function chatAdd(m) {
+        if (!m || typeof m.id !== 'string' || typeof m.text !== 'string') return;
+        chatById.set(m.id, m);
+        chatRender();
+      }
+      function chatHistory(list) {
+        for (const m of Array.isArray(list) ? list : []) if (m && typeof m.id === 'string') chatById.set(m.id, m);
+        chatRender();
+      }
+      let chatStatusTimer = null;
+      function chatError(e) {
+        const text = e.reason === 'rate_limited' ? `Más despacio: espera ${Math.ceil(e.retryInMs / 1000)} s`
+          : e.reason === 'muted' ? `Silenciado ${Math.ceil(e.retryInMs / 1000)} s por mandar demasiados mensajes`
+          : e.reason === 'too_long' ? `Máximo ${e.maxChars || 200} caracteres`
+          : e.reason === 'empty' ? 'Mensaje vacío' : 'Mensaje no válido';
+        chatStatus.textContent = text;
+        chatStatus.classList.add('error');
+        clearTimeout(chatStatusTimer);
+        chatStatusTimer = setTimeout(() => { chatStatus.textContent = ''; chatStatus.classList.remove('error'); }, 4000);
+      }
+      document.getElementById('chat-form').addEventListener('submit', (e) => {
+        e.preventDefault();
+        const text = chatInput.value.trim();
+        if (!text) return;
+        send({ type: 'chat', text });
+        chatInput.value = '';
+      });
+      // Enter fuera del chat lo enfoca; Esc lo suelta y se vuelve a manejar
+      window.addEventListener('keydown', (e) => {
+        if (SPECTATOR) return;
+        if (e.code === 'Enter' && document.activeElement !== chatInput && e.target.tagName !== 'INPUT') {
+          e.preventDefault();
+          chatInput.focus();
+        } else if (e.code === 'Escape' && document.activeElement === chatInput) {
+          chatInput.blur();
+        }
+      });
+
       document.getElementById('logout').addEventListener('click', () => {
+        if (SPECTATOR) { window.location.href = 'login.html'; return; }
         loggingOut = true;
         localStorage.removeItem('token');
         localStorage.removeItem('username');

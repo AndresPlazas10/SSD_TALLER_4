@@ -105,6 +105,10 @@
       <button type="submit">Crear cuenta y entrar</button>
       <button type="button" id="google-cancel" class="ghost">Cancelar</button>
     </form>
+    <!-- Examen final (track 2.5): mirar la partida sin cuenta -->
+    <p class="spectate-link"><a href="lobby.html?spectate">👀 Ver la partida como espectador (sin iniciar sesión)</a></p>
+    <!-- A qué auth replicado le está hablando la página (Taller 7) -->
+    <p id="auth-chip" class="auth-chip" aria-live="polite"></p>
   </main>
 
   <div class="road" aria-hidden="true">
@@ -112,10 +116,16 @@
     <svg class="car car-taxi" viewBox="0 0 122 50"><rect x="54" y="1" width="20" height="8" rx="2" fill="#0a0a0a"/><path d="M8 34 Q8 26 16 25 L34 23 L46 12 Q49 9 54 9 L80 9 Q85 9 88 13 L97 23 L108 25 Q114 26 114 32 L114 36 Q114 38 112 38 L10 38 Q8 38 8 36 Z" fill="#ffd54d" stroke="#0a0a0a" stroke-width="1.5"/><path d="M38 23 L48 13 Q50 12 53 12 L64 12 L64 23 Z M68 12 L80 12 Q83 12 85 15 L92 23 L68 23 Z" fill="#1d2230"/><rect x="108" y="27" width="6" height="3" rx="1.5" fill="#fff"/><circle cx="30" cy="38" r="9" fill="#0a0a0a"/><circle cx="92" cy="38" r="9" fill="#0a0a0a"/></svg>
   </div>
 
-  <!-- AUTH_URL y GOOGLE_CLIENT_ID vienen del .env del cliente (server.js los sirve como /config.js) -->
+  <!-- AUTH_URLS y GOOGLE_CLIENT_ID vienen del .env del cliente (server.js los sirve como /config.js) -->
   <script src="config.js"></script>
+  <script src="auth-client.js"></script>
   <script>
-    const { AUTH_URL, GOOGLE_CLIENT_ID } = window.APP_CONFIG;
+    const { GOOGLE_CLIENT_ID } = window.APP_CONFIG;
+    const authChip = document.getElementById('auth-chip');
+    AuthClient.onChange((i) => {
+      authChip.textContent = AuthClient.label(i);
+      authChip.title = `Auth replicados: ${AuthClient.urls().join(', ')}`;
+    });
 
     function enterGame(data) {
       localStorage.setItem('token', data.token);
@@ -130,20 +140,23 @@
       banner.className = 'msg ' + kind;
     }
 
-    async function authPost(path, body) {
-      const res = await fetch(`${AUTH_URL}${path}`, {
+    // POST con failover entre los auth y redirección al líder (auth-client.js)
+    function authPost(path, body) {
+      return AuthClient.request(path, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          // ngrok free muestra una página intermedia a peticiones de navegador; este header la omite
-          'ngrok-skip-browser-warning': 'true',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
-      let data = {};
-      try { data = await res.json(); } catch (_) {}
-      return { status: res.status, data };
     }
+
+    // Errores de la replicación en palabras
+    const REPLICATION_ERRORS = {
+      no_leader: 'Los servidores de autenticación están eligiendo un nuevo líder. Intenta de nuevo en unos segundos.',
+      no_quorum: 'Solo queda un servidor de autenticación: el registro se bloquea hasta que vuelva otro (no se puede replicar).',
+      replication_timeout: 'El registro no se pudo replicar a tiempo. Intenta de nuevo.',
+      not_leader: 'No se encontró al servidor líder de autenticación. Intenta de nuevo.',
+    };
+    const errorText = (data, status) => REPLICATION_ERRORS[data.error] || data.hint || data.error || `Error ${status}`;
 
     // POST /register -> 201 { userId, username, vehicle } | 400 | 409
     document.getElementById('register-form').addEventListener('submit', async (e) => {
@@ -159,10 +172,10 @@
           document.getElementById('login-username').value = data.username;
           document.getElementById('login-password').focus();
         } else {
-          show(data.error || `Error ${status}`, 'error');
+          show(errorText(data, status), 'error');
         }
       } catch (err) {
-        show('No se pudo contactar el servicio de autenticación', 'error');
+        show('No se pudo contactar ningún servidor de autenticación', 'error');
       }
     });
 
@@ -177,10 +190,10 @@
           enterGame(data);
         } else {
           // use_google_login trae un hint legible: la cuenta no tiene contraseña
-          show(data.hint || data.error || `Error ${status}`, 'error');
+          show(errorText(data, status), 'error');
         }
       } catch (err) {
-        show('No se pudo contactar el servicio de autenticación', 'error');
+        show('No se pudo contactar ningún servidor de autenticación', 'error');
       }
     });
 
@@ -215,9 +228,9 @@
             ? 'Tu cuenta de Google no tiene el email verificado.'
             : 'Google no validó tu identidad. Intenta de nuevo con el botón de Google.', 'error');
         }
-        show(data.error || `Error ${status}`, 'error');
+        show(errorText(data, status), 'error');
       } catch (err) {
-        show('No se pudo contactar el servicio de autenticación', 'error');
+        show('No se pudo contactar ningún servidor de autenticación', 'error');
       }
     }
 
