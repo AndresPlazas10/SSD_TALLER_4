@@ -1668,8 +1668,9 @@
               if (!SPECTATOR) showRadar();
             }
             if (SPECTATOR) return; // sin auto propio: nada de controles ni extras
-            // Track 2.1: el coordinador lo recuperó de lo guardado
-            if (msg.restored) toast = { text: '💾 Volviste donde habías quedado (posición y pasajeros guardados)', mine: true, until: performance.now() + 3500 };
+            // Track 2.1: si el coordinador lo recuperó de lo guardado
+            // (msg.restored) no se avisa nada: el jugador sigue donde estaba
+            if (msg.restored) console.log('[lobby] el coordinador recuperó tu posición y pasajeros de lo guardado');
             // El nombre viene del JWT validado: si el token cambió de usuario, se actualiza
             document.getElementById('me').textContent = msg.you.username;
             const avatar = avatarFor(msg.you.username);
