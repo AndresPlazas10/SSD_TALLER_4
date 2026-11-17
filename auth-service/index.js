@@ -571,9 +571,13 @@ app.get('/coordinator', (req, res) => {
   return res.json({ coordinatorId: best.coordinatorId, publicUrl: best.publicUrl });
 });
 
-// Taller 7: GET /peers lista los otros auth (authId, publicUrl, peerUrl, role).
-// Los coordinadores siguen pidiendo aquí a sus pares: con su token de
-// coordinador (o ?type=coordinators) se devuelve la lista de coordinadores vivos.
+// GET /peers sirve a los dos enunciados:
+// - Taller 7: `peers` = los otros auth (authId, publicUrl, peerUrl, role);
+// - Taller 6: `coordinators` = los coordinadores vivos (coordinatorId, peerUrl).
+//   Así, abrir /peers en el navegador muestra también los coordinadores.
+// Los coordinadores piden aquí a sus pares del mesh: con su token de
+// coordinador (o ?type=coordinators) reciben `peers` = la lista de
+// coordinadores, el formato del Taller 6 que lee mesh.js.
 function isCoordinatorRequest(req) {
   if (req.query.type === 'coordinators') return true;
   const auth = req.headers.authorization || '';
@@ -589,7 +593,11 @@ app.get('/peers', (req, res) => {
   if (isCoordinatorRequest(req)) {
     return res.json({ peers: aliveCoordinators().map((c) => ({ coordinatorId: c.coordinatorId, peerUrl: c.peerUrl })) });
   }
-  return res.json({ authId: replication.authId, peers: replication.peerList() });
+  return res.json({
+    authId: replication.authId,
+    peers: replication.peerList(),
+    coordinators: aliveCoordinators().map((c) => ({ coordinatorId: c.coordinatorId, peerUrl: c.peerUrl })),
+  });
 });
 
 // Vista de depuración del directorio (sin URLs internas del mesh)

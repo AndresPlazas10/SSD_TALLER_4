@@ -266,7 +266,7 @@ npm test     # en la raíz: auth-service y coordinator
   - el espectador de solo lectura, sin contar en el balanceo y con su límite;
   - matar los 3 coordinadores y volver al mismo lugar, que la copia vieja pierda y el tombstone.
 
-Detalle en [12. Tests automáticos](#12-tests-automáticos). Hoy: **auth 43/43, coordinator 49/49**.
+Detalle en [12. Tests automáticos](#12-tests-automáticos). Hoy: **auth 44/44, coordinator 49/49**.
 
 ## Guion de la sustentación final
 
@@ -343,7 +343,10 @@ Sin `AUTH_PEERS` el auth funciona **solo** y es siempre líder, como en los tall
 Endpoints nuevos:
 
 - `GET /status`: `{ authId, role, publicUrl, peerUrl, leaderUrl, knownPeers, lastAppliedSeq, users, term, leaderId, clusterSize }`. Es lo que se mira en la sustentación.
-- `GET /peers`: los **otros auth**, `[{ authId, publicUrl, peerUrl, role, connected }]`. Los coordinadores siguen pidiendo aquí a sus pares del mesh: con su token de coordinador (o `?type=coordinators`) reciben la lista de coordinadores, como en el Taller 6.
+- `GET /peers`: cumple los dos enunciados a la vez.
+  - `peers`: los **otros auth**, `[{ authId, publicUrl, peerUrl, role, connected }]` (Taller 7).
+  - `coordinators`: los **coordinadores vivos**, `[{ coordinatorId, peerUrl }]` (Taller 6).
+  - Abrirlo en el navegador muestra los dos. Los coordinadores, con su token (o `?type=coordinators`), reciben en `peers` la lista de coordinadores, el formato del Taller 6 que usa el mesh.
 - Todas las respuestas traen los headers `X-Auth-Id` y `X-Auth-Role`. La página los usa para mostrar qué auth la atiende.
 
 Errores de una escritura en el líder:
@@ -1255,7 +1258,7 @@ Igual que en la Parte I: gana la conexión nueva y la anterior se cierra con `40
 ## 12. Tests automáticos
 
 ```bash
-cd auth-service && npm test     # 43 tests (28 + 9 del directorio + 6 del cluster de 3 auth reales): esquema, /register, /login, /auth/google, migración, replicación y elección
+cd auth-service && npm test     # 44 tests (28 + 10 del directorio + 6 del cluster de 3 auth reales): esquema, /register, /login, /auth/google, migración, replicación y elección
 cd coordinator  && npm test     # 49 tests (31 + 9 del mesh + 2 con 3 auth replicados + 7 de los tracks del examen final, procesos reales)
 ```
 

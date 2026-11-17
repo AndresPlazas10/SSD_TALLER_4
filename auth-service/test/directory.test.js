@@ -130,6 +130,18 @@ test('un coordinador sin heartbeat por más del TTL se descarta (no se devuelve 
   assert.ok(!coordinators.has('coord-a'));
 });
 
+test('GET /peers sin token (navegador): los auth en peers y los coordinadores vivos en coordinators', async () => {
+  await heartbeat('coord-a', 0);
+  await heartbeat('coord-b', 0);
+  const r = await get('/peers');
+  assert.strictEqual(r.status, 200);
+  assert.deepStrictEqual(r.data.peers, []); // auth solo: no tiene otros auth
+  assert.deepStrictEqual(r.data.coordinators, [
+    { coordinatorId: 'coord-a', peerUrl: 'ws://localhost:5101' },
+    { coordinatorId: 'coord-b', peerUrl: 'ws://localhost:5102' },
+  ]);
+});
+
 test('GET /peers: lista los vivos con su peerUrl', async () => {
   await heartbeat('coord-a', 0);
   await heartbeat('coord-b', 0);

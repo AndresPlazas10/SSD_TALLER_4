@@ -136,6 +136,7 @@ test('1. los tres arrancan, eligen UN líder (el que trae los usuarios existente
   });
   assert.deepStrictEqual(data.peers.map((p) => [p.authId, p.role]).sort(), [['auth-a', 'leader'], ['auth-c', 'replica']]);
   assert.ok(data.peers.every((p) => p.peerUrl && p.publicUrl));
+  assert.ok(Array.isArray(data.coordinators), 'también trae los coordinadores (Taller 6)');
 });
 
 test('2. alta de alice en el líder: 201 recién cuando una réplica la tiene; queda en los tres con el mismo userId', { timeout: 90000 }, async () => {
