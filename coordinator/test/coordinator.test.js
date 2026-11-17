@@ -8,6 +8,9 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const jwt = require('jsonwebtoken');
 const WebSocket = require('ws');
+// Persistencia del examen final: en memoria, así un test no hereda el estado
+// guardado por otro (ni por el coordinador de desarrollo)
+process.env.STATE_DB = ':memory:';
 
 // Los coordinadores de prueba no deben heredar la configuración de despliegue
 // del .env de desarrollo (URLs de ngrok, id, puertos del mesh): vacías = valores
@@ -486,8 +489,9 @@ test('marcador por equipo: suma solo a los conectados; al cerrar sesión se desc
   const conPunto = await obs.waitFor((m) => m.type === 'state' && me(m, '27') && me(m, '27').score >= 1);
   assert.strictEqual(conPunto.teams.uber, me(conPunto, '27').score);
 
-  // El Uber cierra sesión: su puntaje deja de contar para el equipo
-  uber.close();
+  // El Uber cierra sesión (el botón manda 1000 'logout'): su puntaje deja de
+  // contar para el equipo y lo guardado se borra
+  uber.close(1000, 'logout');
   await uber.closed;
   const sinEl = await obs.waitFor((m) => m.type === 'state' && !me(m, '27'));
   assert.strictEqual(sinEl.teams.uber, 0);
@@ -498,6 +502,26 @@ test('marcador por equipo: suma solo a los conectados; al cerrar sesión se desc
   assert.strictEqual(me(s, '27').score, 0);
   assert.strictEqual(s.teams.uber, 0);
   for (const ws of [vuelve, obs]) { ws.close(); await ws.closed; }
+});
+
+test('persistencia: cerrar la pestaña (sin cerrar sesión) guarda el lugar y los pasajeros; al volver sigue ahí', async () => {
+  const uber = connect(sign(31, 'pepa', {}, 'local', 'uber'));
+  await uber.waitFor((m) => m.type === 'state' && me(m, '31'));
+  await driveToPassenger(uber, '31');
+  uber.send({ type: 'intent', intent: { dir: { x: 0, y: 0 } } });
+  await sleep(300);
+  const before = me(lastState(uber), '31');
+  assert.ok(before.score >= 1);
+  uber.close(); // pestaña cerrada / red perdida: 1005, no es logout
+  await uber.closed;
+  const back = connect(sign(31, 'pepa', {}, 'local', 'uber'));
+  const w = await back.waitFor((m) => m.type === 'welcome');
+  assert.strictEqual(w.restored, true);
+  const after = me(await back.waitFor((m) => m.type === 'state' && me(m, '31')), '31');
+  assert.ok(Math.hypot(after.x - before.x, after.y - before.y) < 2, `vuelve donde estaba (${after.x},${after.y} vs ${before.x},${before.y})`);
+  assert.strictEqual(after.score, before.score);
+  back.close(1000, 'logout');
+  await back.closed;
 });
 
 test('choque entre autos: al manejar uno contra otro no se superponen', async () => {

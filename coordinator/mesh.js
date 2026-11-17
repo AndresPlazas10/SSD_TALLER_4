@@ -1,7 +1,9 @@
 // Mesh entre coordinadores (Taller 6).
 //
 // - Directorio: cada HEARTBEAT_MS (2 s) el coordinador se anuncia en el auth
-//   (POST /heartbeat) y pide la lista de pares vivos (GET /peers).
+//   (POST /heartbeat) y pide la lista de pares vivos (GET /peers). Con varios
+//   auth replicados (Taller 7) habla con el líder y, si no responde, con otro
+//   de AUTH_URLS (ver auth-pool.js).
 // - Conexiones: cada coordinador escucha a sus pares en su propio puerto
 //   (PEER_PORT, separado del WS de los jugadores). Para que cada par tenga UNA
 //   sola conexión, solo inicia la conexión el de coordinatorId menor; el otro
@@ -25,7 +27,7 @@ const PEER_PING_MS = 2000;
 const HELLO_TIMEOUT_MS = 5000;
 const MAX_PEER_MESSAGE_BYTES = 256 * 1024;
 
-function createMesh({ id, peerPort, publicUrl, peerUrl, authUrl, secret, startedAt, getConnectedPlayers, onMessage, onPeerUp, onPeerDown }) {
+function createMesh({ id, peerPort, publicUrl, peerUrl, auth, secret, startedAt, getConnectedPlayers, getSpectators = () => 0, onMessage, onPeerUp, onPeerDown }) {
   // peerId -> { ws, startedAt } (solo pares con handshake completo)
   const peers = new Map();
   const connecting = new Set();
@@ -132,23 +134,31 @@ function createMesh({ id, peerPort, publicUrl, peerUrl, authUrl, secret, started
   async function directoryCycle() {
     const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${token()}`, 'ngrok-skip-browser-warning': 'true' };
     try {
-      const hb = await fetch(`${authUrl}/heartbeat`, {
-        method: 'POST', headers, signal: AbortSignal.timeout(4500),
+      const { res: hb, body: hbBody, url } = await auth.request('/heartbeat', {
+        method: 'POST', headers,
         body: JSON.stringify({
           coordinatorId: id, publicUrl, peerUrl,
           connectedPlayers: getConnectedPlayers(),
+          // Examen final: los espectadores van aparte (no cuentan como jugadores)
+          spectators: getSpectators(),
           uptime: Math.round((Date.now() - startedAt) / 1000),
         }),
       });
       if (!hb.ok) {
-        let detail = '';
-        try { detail = (await hb.json()).error || ''; } catch (_) {}
-        throw new Error(`heartbeat HTTP ${hb.status}${detail ? `: ${detail}` : ''}`);
+        const detail = (hbBody && hbBody.error) || '';
+        throw new Error(`heartbeat ${url} HTTP ${hb.status}${detail ? `: ${detail}` : ''}`);
       }
-      const res = await fetch(`${authUrl}/peers`, { headers, signal: AbortSignal.timeout(4500) });
+      // La respuesta dijo quién es el líder de los auth (y no era este):
+      // el heartbeat va enseguida al líder, sin esperar al próximo ciclo
+      if (auth.current() !== url) {
+        await auth.request('/heartbeat', { method: 'POST', headers, body: JSON.stringify({
+          coordinatorId: id, publicUrl, peerUrl, connectedPlayers: getConnectedPlayers(), spectators: getSpectators(),
+          uptime: Math.round((Date.now() - startedAt) / 1000),
+        }) }).catch(() => {});
+      }
+      const { res, body } = await auth.request('/peers', { headers });
       if (!res.ok) throw new Error(`peers HTTP ${res.status}`);
-      const body = await res.json();
-      if (directoryOk === false) console.log('[mesh] el directorio responde de nuevo');
+      if (directoryOk === false) console.log(`[mesh] el directorio responde de nuevo (${url})`);
       directoryOk = true;
       for (const peer of Array.isArray(body.peers) ? body.peers : []) {
         if (!peer || typeof peer.coordinatorId !== 'string' || typeof peer.peerUrl !== 'string') continue;
@@ -156,7 +166,7 @@ function createMesh({ id, peerPort, publicUrl, peerUrl, authUrl, secret, started
         if (peer.coordinatorId > id) connectTo(peer);     // solo inicia el de id menor
       }
     } catch (err) {
-      if (directoryOk !== false) console.error(`[mesh] directorio ${authUrl} no disponible (${err.message}); reintentando cada ${HEARTBEAT_MS / 1000} s`);
+      if (directoryOk !== false) console.error(`[mesh] directorio no disponible en ningún auth (${err.message}); reintentando cada ${HEARTBEAT_MS / 1000} s`);
       directoryOk = false;
     }
   }

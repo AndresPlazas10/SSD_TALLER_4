@@ -11,6 +11,8 @@ const { WebSocketServer } = require('ws');
 const jwt = require('jsonwebtoken');
 const { buildCity, resolve, collides } = require('./map');
 const { createMesh } = require('./mesh');
+const { createStore } = require('./persistence');
+const { createChat, createRateLimiter, sanitizeChatText, MAX_CHARS: CHAT_MAX_CHARS } = require('./chat');
 
 // Varios coordinadores en un mismo equipo comparten el .env: el id y los
 // puertos se pueden pasar por línea de comandos (ver los scripts de package.json):
@@ -73,7 +75,11 @@ function checkWsUrl(value, name, allowPath) {
 for (const problem of [checkWsUrl(PUBLIC_URL, 'PUBLIC_URL', false), checkWsUrl(PEER_URL, 'PEER_URL', true)]) {
   if (problem) { console.error(`Configuración inválida: ${problem}`); process.exit(1); }
 }
-if (process.env.AUTH_URL && /localhost|127\.0\.0\.1/.test(PEER_URL) && !/localhost|127\.0\.0\.1/.test(process.env.AUTH_URL)) {
+// Taller 7: varios auth replicados. AUTH_URLS (lista) o, como antes, AUTH_URL.
+const { parseAuthUrls, createAuthPool } = require('./auth-pool');
+const AUTH_URLS = parseAuthUrls(cliArg('auth-urls') || process.env.AUTH_URLS || process.env.AUTH_URL);
+const authPool = createAuthPool(AUTH_URLS);
+if (AUTH_URLS.length && /localhost|127\.0\.0\.1/.test(PEER_URL) && !AUTH_URLS.some((u) => /localhost|127\.0\.0\.1/.test(u))) {
   console.warn(`Aviso: PEER_URL=${PEER_URL} apunta a localhost pero el directorio está en otro equipo: los coordinadores de otros equipos no podrán conectarse a este. Configurar PUBLIC_HOST (IP LAN) o PEER_URL.`);
 }
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -104,8 +110,8 @@ try {
 
 // Política de tokens del auth (GET /token-policy): si se cambia JWT_EXPIRES_IN
 // en el auth, el coordinador lo aplica también a las sesiones abiertas.
-// AUTH_URL vacío = desactivado (solo cuentan el exp del token y SESSION_MAX_AGE).
-const AUTH_URL = (process.env.AUTH_URL || '').trim().replace(/\/+$/, '');
+// Sin AUTH_URLS / AUTH_URL = desactivado (solo cuentan el exp del token y SESSION_MAX_AGE).
+const AUTH_URL = AUTH_URLS[0] || '';
 const TOKEN_POLICY_POLL_MS = parseInt(process.env.TOKEN_POLICY_POLL_MS || '1000', 10);
 let authExpiresInS = null; // último valor recibido del auth
 // Momento (ms) en que se aplicó cada límite. Una sesión abierta antes de un
@@ -141,6 +147,21 @@ const REBALANCE_MS = parseInt(process.env.REBALANCE_MS || '3000', 10);
 // antes de parsearlo, así nadie puede mandar 10 MB.
 const MAX_MESSAGE_BYTES = 4096;
 const MAX_EXTRAS_CHARS = 1024;
+// --- Examen final ---
+// Persistencia (track 2.1): cada PERSIST_MS se guarda el mundo en STATE_DB
+// (una SQLite por coordinador). Lo guardado vale SAVED_TTL_MS: un jugador que
+// vuelve después ya no recupera su lugar, y una ronda pausada más de
+// MATCH_RESUME_MS no se reanuda (empieza otra).
+const PERSIST_MS = parseInt(process.env.PERSIST_MS || '2000', 10);
+const STATE_DB = cliArg('state-db') || process.env.STATE_DB || `state-${COORDINATOR_ID}.db`;
+const SAVED_TTL_MS = parseInt(process.env.SAVED_TTL_MS || String(10 * 60 * 1000), 10);
+const MATCH_RESUME_MS = parseInt(process.env.MATCH_RESUME_MS || String(10 * 60 * 1000), 10);
+// Espectadores (track 2.5): máximo por coordinador y cada cuántos ticks
+// reciben el state (2 = 10 Hz: la mitad del costo de un jugador)
+const MAX_SPECTATORS = parseInt(process.env.MAX_SPECTATORS || '50', 10);
+const SPECTATOR_EVERY = Math.max(1, parseInt(process.env.SPECTATOR_EVERY || '2', 10));
+// Chat (track 2.6): últimos CHAT_HISTORY mensajes en memoria (y en STATE_DB)
+const CHAT_HISTORY = parseInt(process.env.CHAT_HISTORY || '50', 10);
 
 if (!JWT_SECRET || JWT_SECRET.length < 32) {
   console.error('JWT_SECRET debe existir en el .env, tener al menos 32 caracteres y ser la misma que usa auth-service');
@@ -149,9 +170,23 @@ if (!JWT_SECRET || JWT_SECRET.length < 32) {
 
 const app = express();
 app.get('/health', (req, res) => res.json({
-  ok: true, coordinatorId: COORDINATOR_ID, players: players.size, localPlayers: localCount(), tickRate: TICK_RATE,
-  peers: mesh ? mesh.peerIds() : [], leader: mesh ? mesh.leader() : COORDINATOR_ID,
+  ok: true, coordinatorId: COORDINATOR_ID, players: players.size, localPlayers: localCount(), spectators: spectators.size,
+  tickRate: TICK_RATE, peers: mesh ? mesh.peerIds() : [], leader: mesh ? mesh.leader() : COORDINATOR_ID,
+  chatSeq: chat.lastSeq(), savedPlayers: saved.size, round: match.round, phase: match.phase,
 }));
+// Estado guardado de un jugador (demo de persistencia: ¿dónde quedó alice?)
+app.get('/status', (req, res) => {
+  const list = [];
+  for (const [userId, p] of players) {
+    list.push({ userId, username: p.username, x: Math.round(p.x), y: Math.round(p.y), score: p.score, ver: p.ver,
+      owner: p.owner, state: p.socket ? 'conectado aquí' : p.owner ? 'en otro coordinador' : 'en espera' });
+  }
+  for (const [userId, r] of saved) {
+    if (!players.has(userId)) list.push({ userId, username: r.username, x: Math.round(r.x || 0), y: Math.round(r.y || 0), score: r.score, ver: r.ver, state: r.deleted ? 'cerró sesión' : 'guardado' });
+  }
+  res.json({ coordinatorId: COORDINATOR_ID, leader: mesh ? mesh.leader() : COORDINATOR_ID, stateDb: STATE_DB,
+    match: matchSnapshot(Date.now()), paused, spectators: spectators.size, players: list });
+});
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_MESSAGE_BYTES });
@@ -161,6 +196,16 @@ const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_MESSAGE_BYTES 
 // (socket != null, owner = este) y los de los demás coordinadores (socket =
 // null, owner = su coordinador), que llegan por el mesh.
 const players = new Map();
+// Espectadores (track 2.5): sockets sin login, solo lectura. No están en
+// players: no tienen auto, no cuentan para el balanceo ni para el marcador.
+const spectators = new Set();
+// Track 2.1: lo último que se sabe de jugadores que NO están en el mundo ahora
+// (se desconectaron, o vienen del disco tras un reinicio). userId -> registro
+// { username, provider, vehicle, x, y, angle, score, round, extras, ver, deleted }
+// Cuando el jugador vuelve a conectarse, aparece donde quedó.
+const saved = new Map();
+// Versión de un jugador: reloj lógico híbrido (ver persistence.js)
+const bumpVer = (prev) => Math.max(Date.now(), (prev || 0) + 1);
 const isLocal = (p) => p.socket !== null;
 function localCount() {
   let n = 0;
@@ -262,6 +307,10 @@ let passenger = spawnPassenger();
 // (ganador en pantalla, no se recogen pasajeros) -> 'playing' (ronda nueva).
 // Todo lo decide el servidor; el cliente solo muestra match en cada state.
 const match = { phase: 'waiting', round: 0, endsAt: 0, result: null };
+// Ronda interrumpida (todos se fueron o se cayeron todos los coordinadores):
+// { round, phase, remainingMs, result, pausedAt }. Al volver alguien se
+// reanuda donde iba, si no pasó MATCH_RESUME_MS.
+let paused = null;
 
 function startRound(now) {
   match.round += 1;
@@ -272,6 +321,20 @@ function startRound(now) {
   passenger = spawnPassenger();
   console.log(`[partida] empieza la ronda ${match.round} (${MATCH_SECONDS} s)`);
   const event = { type: 'match_start', round: match.round, durationMs: MATCH_SECONDS * 1000 };
+  broadcast(event);
+  if (mesh) { mesh.send({ type: 'match_event', event }); sendWorldSync(); }
+}
+
+// Reanuda la ronda pausada: mismo número, el tiempo que le quedaba y los
+// puntajes que traen los jugadores (no se ponen en 0)
+function resumeRound(now) {
+  match.round = paused.round;
+  match.phase = paused.phase;
+  match.endsAt = now + paused.remainingMs;
+  match.result = paused.result || null;
+  paused = null;
+  console.log(`[partida] se reanuda la ronda ${match.round} (${match.phase}, quedan ${Math.round((match.endsAt - now) / 1000)} s)`);
+  const event = { type: 'match_resume', round: match.round, remainingMs: match.endsAt - now };
   broadcast(event);
   if (mesh) { mesh.send({ type: 'match_event', event }); sendWorldSync(); }
 }
@@ -296,11 +359,16 @@ function endRound(now) {
 
 function updateMatch(now) {
   if (players.size === 0) {
-    // Sin jugadores no corre el reloj: la próxima conexión arranca una ronda
-    match.phase = 'waiting';
+    // Sin jugadores no corre el reloj: la ronda queda en pausa y la próxima
+    // conexión la reanuda (o arranca otra si pasó mucho tiempo)
+    if (match.phase !== 'waiting') {
+      paused = { round: match.round, phase: match.phase, remainingMs: Math.max(0, match.endsAt - now), result: match.result, pausedAt: now };
+      match.phase = 'waiting';
+    }
     return;
   }
-  if (match.phase === 'waiting') startRound(now);
+  if (match.phase === 'waiting' && paused && now - paused.pausedAt < MATCH_RESUME_MS) resumeRound(now);
+  else if (match.phase === 'waiting') startRound(now);
   else if (now >= match.endsAt) {
     if (match.phase === 'playing') endRound(now);
     else startRound(now);
@@ -377,14 +445,14 @@ if (!MAX_AGE_FROM_ENV) fs.watchFile(ENV_FILE, { interval: 1000 }, reloadSessionM
 // Consulta periódica al auth. Si no responde (caído, red) se conserva el
 // último valor: una falla del auth no debe tumbar sesiones ya validadas.
 let authReachable = null;
+let policyInFlight = false; // con varios auth un intento puede tardar más que el intervalo
 async function pollTokenPolicy() {
+  if (policyInFlight) return;
+  policyInFlight = true;
   try {
-    const res = await fetch(`${AUTH_URL}/token-policy`, {
-      headers: { 'ngrok-skip-browser-warning': 'true' },
-      signal: AbortSignal.timeout(1500),
-    });
+    const { res, body } = await authPool.request('/token-policy', { headers: { 'ngrok-skip-browser-warning': 'true' } });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const { expiresInSeconds } = await res.json();
+    const { expiresInSeconds } = body;
     if (!Number.isFinite(expiresInSeconds) || expiresInSeconds <= 0) throw new Error('respuesta inválida');
     if (authReachable === false) console.log('[auth] /token-policy responde de nuevo');
     authReachable = true;
@@ -395,8 +463,10 @@ async function pollTokenPolicy() {
     authPolicyAt = Date.now();
     for (const { socket } of players.values()) if (socket) scheduleExpiry(socket);
   } catch (err) {
-    if (authReachable !== false) console.error(`[auth] no se pudo consultar ${AUTH_URL}/token-policy (${err.message}); se mantiene la duración anterior`);
+    if (authReachable !== false) console.error(`[auth] no se pudo consultar /token-policy en ningún auth (${err.message}); se mantiene la duración anterior`);
     authReachable = false;
+  } finally {
+    policyInFlight = false;
   }
 }
 let policyTimer = null;
@@ -405,23 +475,38 @@ if (AUTH_URL) {
   policyTimer = setInterval(pollTokenPolicy, TOKEN_POLICY_POLL_MS);
 }
 
-// A los clientes de ESTE coordinador (nunca a los pares del mesh)
-function broadcast(obj) {
+// A los clientes de ESTE coordinador (nunca a los pares del mesh). Se
+// serializa UNA vez y se manda el mismo texto a todos: con muchos
+// espectadores el costo es enviar, no armar el JSON. toSpectators = false
+// para lo que no les corresponde (o se les manda aparte, como el state).
+function broadcast(obj, toSpectators = true) {
   const msg = JSON.stringify(obj);
   for (const { socket } of players.values()) {
     if (socket && socket.readyState === socket.OPEN) socket.send(msg);
+  }
+  if (toSpectators) sendToSpectators(msg);
+}
+
+function sendToSpectators(msg) {
+  for (const ws of spectators) {
+    // Un espectador lento (red mala) no acumula estados viejos en memoria:
+    // si tiene más de 256 KB sin enviar, se salta este mensaje
+    if (ws.readyState === ws.OPEN && ws.bufferedAmount < 256 * 1024) ws.send(msg);
   }
 }
 
 // Lista del lobby (solo cambia cuando alguien entra o sale)
 function broadcastPlayers() {
-  const list = Array.from(players.entries()).map(([userId, p]) => ({
+  broadcast({ type: 'players_update', players: playerList() });
+}
+
+function playerList() {
+  return Array.from(players.entries()).map(([userId, p]) => ({
     userId,
     username: p.username,
     provider: p.provider,
     vehicle: p.vehicle,
   }));
-  broadcast({ type: 'players_update', players: list });
 }
 
 // Estado público de cada jugador. Nunca se envía el socket ni el intent.
@@ -512,12 +597,18 @@ function tick() {
   if (mesh && tickCount % Math.max(1, Math.round(TICK_RATE / 10)) === 0) sendPlayerSync();
   if (mesh && leader && tickCount % Math.max(1, Math.round(TICK_RATE / 2)) === 0) sendWorldSync();
 
-  // Un solo broadcast por tick (nunca uno por cada intent)
-  if (players.size > 0) {
-    broadcast({
+  // Un solo broadcast por tick (nunca uno por cada intent). Los espectadores
+  // lo reciben uno de cada SPECTATOR_EVERY ticks (10 Hz) y, si no hay nadie
+  // jugando, igual cada segundo (ven la ciudad vacía y el chat)
+  if (players.size > 0 || (spectators.size && tickCount % TICK_RATE === 0)) {
+    const msg = JSON.stringify({
       type: 'state', t: now, players: snapshot(), passenger: roundPoint(passenger),
       teams: teamScores(), match: matchSnapshot(now),
     });
+    for (const { socket } of players.values()) {
+      if (socket && socket.readyState === socket.OPEN) socket.send(msg);
+    }
+    if (spectators.size && (tickCount % SPECTATOR_EVERY === 0 || players.size === 0)) sendToSpectators(msg);
   }
 }
 
@@ -581,6 +672,19 @@ server.on('upgrade', (req, socket, head) => {
   const { pathname, searchParams } = new URL(req.url, 'http://coordinator');
   const token = searchParams.get('token');
 
+  // Espectador (track 2.5): sin token, solo lectura
+  if (pathname === '/spectate') {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      if (spectators.size >= MAX_SPECTATORS) {
+        // Lleno: el cliente pide otro coordinador al directorio
+        ws.close(4013, 'spectators full');
+        return;
+      }
+      onSpectator(ws);
+    });
+    return;
+  }
+
   if (pathname !== '/connect') {
     // Mesh por el mismo puerto que los jugadores: los otros coordinadores
     // entran por la raíz o por /mesh (así sirve un peerUrl que sea solo el
@@ -630,11 +734,18 @@ wss.on('connection', (ws, payload) => {
   // posición y los extras: es el mismo jugador, no uno nuevo.
   // (Si la sesión anterior está en OTRO coordinador, ese la cierra al recibir
   // el player_joined de esta.)
-  const existing = players.get(userId);
+  let existing = players.get(userId);
+  // Track 2.1: no está en el mundo, pero hay una copia guardada (se había ido
+  // hace poco, o se reiniciaron los coordinadores): vuelve donde quedó
+  const restored = !existing ? restoreFromSaved(userId) : null;
+  if (restored) {
+    existing = restored;
+    console.log(`[persistencia] ${username} vuelve donde quedó: (${Math.round(restored.x)}, ${Math.round(restored.y)}), ${restored.score} pasajeros`);
+  }
   if (existing && existing.socket) {
     console.log(`[ws] ${username} ya estaba conectado: se cierra la sesión anterior`);
     existing.socket.close(4002, 'session replaced');
-  } else if (existing) {
+  } else if (existing && !restored) {
     console.log(`[ws] ${username} venía de ${existing.owner || "un coordinador caído"}: sigue aquí donde estaba (posición y puntaje)`);
   }
 
@@ -654,7 +765,14 @@ wss.on('connection', (ws, payload) => {
     intent: { x: 0, y: 0 },
     extras: existing ? existing.extras : {},
     score: existing ? existing.score : 0,
+    // Sube la versión: esta copia es más nueva que cualquier otra guardada
+    ver: bumpVer(existing ? existing.ver : (saved.get(userId) || {}).ver),
+    // De qué copia guardada salió (si un par trae una más nueva en los
+    // próximos segundos, se corrige: ver mergeSnapshot)
+    restoredFromVer: restored ? restored.ver : null,
+    restoredAt: restored ? Date.now() : null,
   });
+  saved.delete(userId);
   console.log(`[ws] + ${username} [${provider}, ${vehicle}] (${localCount()} aquí, ${players.size} en el mundo)`);
   if (mesh) mesh.send(playerJoinedMsg(userId, players.get(userId)));
 
@@ -662,6 +780,8 @@ wss.on('connection', (ws, payload) => {
   ws.send(JSON.stringify({
     type: 'welcome',
     you: { userId, username, provider, vehicle },
+    // Track 2.1: volvió donde había quedado (posición y pasajeros guardados)
+    restored: !!restored,
     // A qué coordinador está conectado (el cliente lo muestra)
     coordinator: { id: COORDINATOR_ID, peers: mesh ? mesh.peerIds() : [] },
     world: {
@@ -672,6 +792,8 @@ wss.on('connection', (ws, payload) => {
     },
   }));
   broadcastPlayers();
+  // Track 2.6: el historial del chat (últimos CHAT_HISTORY)
+  ws.send(JSON.stringify({ type: 'chat_history', messages: chat.history() }));
 
   // Cerrar el socket cuando el token expire o se cumpla el límite vigente
   ws.tokenTimes = { iat: payload.iat, exp: payload.exp };
@@ -709,22 +831,32 @@ wss.on('connection', (ws, payload) => {
       if (mesh) mesh.send({ type: 'extras_replicate', userId, extras: p.extras });
       return;
     }
+
+    if (msg.type === 'chat') {
+      onChatFromClient(ws, userId, p, msg.text);
+      return;
+    }
   });
 
   // Heartbeat para detectar conexiones muertas
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
-  ws.on('close', () => {
+  ws.on('close', (code, reason) => {
     clearTimeout(ws.expTimer);
     // Solo borrar si el Map todavía apunta a ESTE socket; si fue reemplazado
     // por una sesión nueva, no se debe eliminar la nueva.
     const current = players.get(userId);
     if (current && current.socket === ws) {
       players.delete(userId);
-      console.log(`[ws] - ${username} (${localCount()} aquí, ${players.size} en el mundo)`);
+      // Cerrar sesión borra lo guardado (la próxima vez arranca de cero);
+      // cerrar la pestaña o perder la red NO: vuelve donde quedó
+      const logout = code === 1000 && ['logout', 'token removed'].includes(String(reason));
+      const ver = bumpVer(current.ver);
+      saved.set(userId, logout ? { userId, username, ver, deleted: true } : { ...toRecord(userId, current), ver });
+      console.log(`[ws] - ${username} (${localCount()} aquí, ${players.size} en el mundo)${logout ? ' · cerró sesión' : ' · queda guardado'}`);
       broadcastPlayers();
-      if (mesh) mesh.send({ type: 'player_left', userId });
+      if (mesh) mesh.send({ type: 'player_left', userId, logout, ver });
     }
   });
 
@@ -745,6 +877,8 @@ wss.on('close', () => {
   fs.unwatchFile(ENV_FILE, reloadSessionMaxAge);
   clearInterval(policyTimer);
   clearInterval(rebalanceTimer);
+  clearInterval(chatTimer);
+  clearInterval(persistTimer);
 });
 
 // ===================== Mesh (Taller 6) =====================
@@ -763,14 +897,17 @@ const clampY = (y) => Math.max(PLAYER_RADIUS, Math.min(WORLD_HEIGHT - PLAYER_RAD
 function playerJoinedMsg(userId, p) {
   return {
     type: 'player_joined', userId, username: p.username, provider: p.provider, vehicle: p.vehicle,
-    x: p.x, y: p.y, angle: p.angle, extras: p.extras, score: p.score,
+    x: p.x, y: p.y, angle: p.angle, extras: p.extras, score: p.score, ver: p.ver,
   };
 }
 
 function sendPlayerSync() {
   const list = [];
   for (const [userId, p] of players) {
-    if (isLocal(p)) list.push({ userId, x: Math.round(p.x * 10) / 10, y: Math.round(p.y * 10) / 10, angle: p.angle });
+    if (!isLocal(p)) continue;
+    // El dueño sube la versión cada vez que publica la posición
+    p.ver = bumpVer(p.ver);
+    list.push({ userId, x: Math.round(p.x * 10) / 10, y: Math.round(p.y * 10) / 10, angle: p.angle, v: p.ver });
   }
   if (list.length) mesh.send({ type: 'player_sync', players: list });
 }
@@ -813,7 +950,9 @@ function onPeerMessage(msg, peerId) {
         extras: msg.extras && typeof msg.extras === 'object' && !Array.isArray(msg.extras) && JSON.stringify(msg.extras).length <= MAX_EXTRAS_CHARS
           ? sanitizeExtras(msg.extras, vehicle) : {},
         score: Number.isInteger(msg.score) && msg.score >= 0 ? msg.score : 0,
+        ver: isFiniteNum(msg.ver) ? msg.ver : 0,
       });
+      saved.delete(userId);
       // La misma cuenta se abrió en otro coordinador: esta sesión se cierra
       // (gana la nueva, igual que con dos pestañas en el mismo coordinador)
       if (prev && prev.socket) {
@@ -824,7 +963,12 @@ function onPeerMessage(msg, peerId) {
       return;
     }
     case 'player_left':
-      if (ownedByPeer) { players.delete(userId); broadcastPlayers(); }
+      if (ownedByPeer) {
+        const ver = isFiniteNum(msg.ver) ? msg.ver : bumpVer(p.ver);
+        saved.set(userId, msg.logout === true ? { userId, username: p.username, ver, deleted: true } : { ...toRecord(userId, p), ver });
+        players.delete(userId);
+        broadcastPlayers();
+      }
       return;
     case 'intent_replicate': {
       const intent = sanitizeIntent(msg.intent);
@@ -852,6 +996,7 @@ function onPeerMessage(msg, peerId) {
         const k = q.intent.x || q.intent.y ? 0.35 : 0.6;
         if (err > 3 * PLAYER_RADIUS) { q.x = tx; q.y = ty; } else { q.x += (tx - q.x) * k; q.y += (ty - q.y) * k; }
         if (isFiniteNum(s.angle)) q.angle = s.angle;
+        if (isFiniteNum(s.v) && s.v > (q.ver || 0)) q.ver = s.v;
       }
       return;
     case 'world_sync':
@@ -867,8 +1012,20 @@ function onPeerMessage(msg, peerId) {
       return;
     }
     case 'match_event':
-      if (peerId !== mesh.leader() || !msg.event || !['match_start', 'match_end'].includes(msg.event.type)) return;
+      if (peerId !== mesh.leader() || !msg.event || !['match_start', 'match_end', 'match_resume'].includes(msg.event.type)) return;
       broadcast(msg.event);
+      return;
+    // Track 2.6: el líder numera; todos entregan en orden de número
+    case 'chat_submit':
+      chat.onSubmit(msg.msg, peerId);
+      return;
+    case 'chat_ordered':
+      if (!msg.msg || msg.msg.orderedBy !== peerId) return;
+      chat.onOrdered(msg.msg);
+      return;
+    // Track 2.1: lo que tiene guardado un par que acaba de conectarse
+    case 'state_snapshot':
+      mergeSnapshot(msg, peerId);
       return;
     default:
   }
@@ -884,6 +1041,7 @@ function applyWorld(msg) {
     match.round = m.round;
     match.endsAt = Date.now() + m.remainingMs; // relativo: no depende del reloj del líder
     match.result = m.phase === 'ended' && m.result ? m.result : null;
+    paused = null; // la partida la decide el líder
   }
   if (msg.scores && typeof msg.scores === 'object') {
     for (const [userId, score] of Object.entries(msg.scores)) {
@@ -898,6 +1056,8 @@ function onPeerUp(peerId) {
   // cómo está el mundo
   for (const [userId, p] of players) if (isLocal(p)) mesh.sendTo(peerId, playerJoinedMsg(userId, p));
   if (mesh.isLeader()) sendWorldSync();
+  // Track 2.1: y todo lo que tengo guardado, para que reconcilie con lo suyo
+  mesh.sendTo(peerId, { type: 'state_snapshot', ...snapshotForPeer() });
 }
 
 function onPeerDown(peerId) {
@@ -922,7 +1082,12 @@ function onPeerDown(peerId) {
 function expireOrphans(now) {
   let removed = 0;
   for (const [userId, p] of players) {
-    if (p.owner === null && now - p.orphanSince > ORPHAN_GRACE_MS) { players.delete(userId); removed++; }
+    if (p.owner === null && now - p.orphanSince > ORPHAN_GRACE_MS) {
+      // Sale del mundo pero queda guardado: si vuelve más tarde, aparece ahí
+      saved.set(userId, toRecord(userId, p));
+      players.delete(userId);
+      removed++;
+    }
   }
   if (removed) {
     console.log(`[mesh] ${removed} jugador(es) no volvieron a conectarse: se borran`);
@@ -956,19 +1121,269 @@ function rebalance() {
   candidate.socket.send(JSON.stringify({ type: 'migrate', reason: 'balance' }));
 }
 
+// ===================== Espectadores (track 2.5) =====================
+// Reciben lo mismo que un jugador (state, eventos, chat) pero no tienen auto:
+// todo lo que manden se ignora. No cuentan en connectedPlayers (el balanceo
+// de jugadores no los ve); el directorio los reparte aparte (?role=spectator).
+// Costo: el state se serializa una vez por tick y se les manda a 10 Hz, con
+// un máximo de MAX_SPECTATORS por coordinador (ver README).
+function onSpectator(ws) {
+  spectators.add(ws);
+  ws.spectator = true;
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+  console.log(`[espectador] + (${spectators.size}/${MAX_SPECTATORS} aquí)`);
+  ws.send(JSON.stringify({
+    type: 'welcome', spectator: true, you: null,
+    coordinator: { id: COORDINATOR_ID, peers: mesh ? mesh.peerIds() : [] },
+    world: {
+      width: WORLD_WIDTH, height: WORLD_HEIGHT, playerRadius: PLAYER_RADIUS, tickRate: TICK_RATE,
+      passengerRadius: PASSENGER_RADIUS, spectatorHz: TICK_RATE / SPECTATOR_EVERY,
+      cell: city.cell, sidewalk: city.sidewalk, obstacles: city.obstacles, blocks: city.blocks,
+    },
+  }));
+  ws.send(JSON.stringify({ type: 'players_update', players: playerList() }));
+  ws.send(JSON.stringify({ type: 'chat_history', messages: chat.history() }));
+  // Solo lectura: se ignora todo (sin parsear siquiera más de lo necesario).
+  // Uno que inunda (más de 30 mensajes en 1 s) se desconecta.
+  let windowStart = Date.now();
+  let count = 0;
+  let warnedAt = 0;
+  ws.on('message', (raw) => {
+    const now = Date.now();
+    if (now - windowStart > 1000) { windowStart = now; count = 0; }
+    if (++count > 30) { ws.close(4008, 'flood'); return; }
+    let type = '?';
+    try { type = String((JSON.parse(raw.toString()) || {}).type).slice(0, 20); } catch (_) {}
+    if (now - warnedAt > 1000) {
+      warnedAt = now;
+      console.log(`[espectador] mensaje "${type}" ignorado: los espectadores son de solo lectura`);
+      ws.send(JSON.stringify({ type: 'spectator_ignored', reason: 'read_only', ignored: type }));
+    }
+  });
+  ws.on('close', () => {
+    spectators.delete(ws);
+    console.log(`[espectador] - (${spectators.size} aquí)`);
+  });
+  ws.on('error', () => {});
+}
+
+// ===================== Chat distribuido (track 2.6) =====================
+const chatLimiter = createRateLimiter();
+const chat = createChat({
+  selfId: COORDINATOR_ID,
+  historySize: CHAT_HISTORY,
+  isLeader: () => !mesh || mesh.isLeader(),
+  sendToLeader: (m) => { if (mesh) mesh.sendTo(mesh.leader(), m); },
+  sendToPeers: (m) => { if (mesh) mesh.send(m); },
+  deliver: (m) => broadcast({ type: 'chat', message: m }),
+});
+const chatTimer = setInterval(() => chat.maintain(), 1000);
+
+function onChatFromClient(ws, userId, p, text) {
+  const clean = sanitizeChatText(text);
+  if (clean.error) {
+    ws.send(JSON.stringify({ type: 'chat_error', reason: clean.error, maxChars: CHAT_MAX_CHARS }));
+    return;
+  }
+  // Por usuario (no por socket): reconectar no reinicia el límite
+  const limit = chatLimiter(userId);
+  if (!limit.ok) {
+    if (limit.justMuted) console.log(`[chat] ${p.username} silenciado ${limit.retryInMs / 1000} s por insistir con el límite`);
+    ws.send(JSON.stringify({ type: 'chat_error', reason: limit.reason, retryInMs: limit.retryInMs }));
+    return;
+  }
+  chat.submit({ userId, username: p.username, vehicle: p.vehicle, text: clean.text });
+}
+
+// ===================== Persistencia (track 2.1) =====================
+// Registro de un jugador para guardar o mandar a un par
+function toRecord(userId, p) {
+  return {
+    userId, username: p.username, provider: p.provider, vehicle: p.vehicle,
+    x: Math.round(p.x * 10) / 10, y: Math.round(p.y * 10) / 10, angle: p.angle,
+    score: p.score, round: match.phase === 'waiting' && paused ? paused.round : match.round,
+    extras: p.extras, ver: p.ver || 0,
+  };
+}
+
+const isFresh = (ver, now = Date.now()) => isFiniteNum(ver) && now - ver < SAVED_TTL_MS;
+
+// Copia guardada utilizable para un jugador que se conecta (o null)
+function restoreFromSaved(userId) {
+  const r = saved.get(userId);
+  if (!r || r.deleted || !isFresh(r.ver) || !isFiniteNum(r.x) || !isFiniteNum(r.y)) return null;
+  // Sus pasajeros solo cuentan si es la misma ronda (si no, ya se reinició)
+  const round = match.phase === 'waiting' && paused ? paused.round : match.round;
+  return {
+    x: clampX(r.x), y: clampY(r.y), angle: isFiniteNum(r.angle) ? r.angle : 0,
+    extras: r.extras && typeof r.extras === 'object' ? sanitizeExtras(r.extras, r.vehicle === 'uber' ? 'uber' : 'taxi') : {},
+    score: r.round === round && Number.isInteger(r.score) && r.score >= 0 ? r.score : 0,
+    ver: r.ver, socket: null,
+  };
+}
+
+// La partida tal como se guarda o se manda a un par. savedAt: momento del dato.
+function matchRecord(now = Date.now()) {
+  if (match.phase !== 'waiting') {
+    return { round: match.round, phase: match.phase, remainingMs: Math.max(0, match.endsAt - now), result: match.result, savedAt: now };
+  }
+  if (paused) return { ...paused, savedAt: paused.pausedAt };
+  return { round: match.round, phase: 'waiting', remainingMs: 0, result: null, savedAt: now };
+}
+
+// Cuánto avanzó una partida: ronda, y dentro de la ronda, cuánto tiempo pasó.
+// No depende de los relojes: sirve para decidir cuál de dos copias es la más
+// reciente (una ronda más adelantada siempre es posterior).
+function matchProgress(m) {
+  if (!m || !Number.isInteger(m.round)) return -1;
+  const phaseBase = m.phase === 'ended' ? MATCH_SECONDS * 1000 : 0;
+  const total = m.phase === 'ended' ? MATCH_BREAK_SECONDS * 1000 : MATCH_SECONDS * 1000;
+  const elapsed = m.phase === 'waiting' ? 0 : Math.max(0, total - (m.remainingMs || 0));
+  return m.round * 1e9 + phaseBase + elapsed;
+}
+
+function snapshotForPeer() {
+  const now = Date.now();
+  const list = [];
+  for (const [userId, p] of players) list.push(toRecord(userId, p));
+  for (const [userId, r] of saved) if (!players.has(userId) && isFresh(r.ver, now)) list.push(r);
+  return { players: list, match: matchRecord(now), passenger, chat: chat.history(), chatSeq: chat.lastSeq() };
+}
+
+// Reconciliación con lo que trae un par: por jugador gana la versión mayor.
+// Un jugador que está en el mundo (conectado a algún coordinador) no se toca:
+// su dueño lo publica en vivo y siempre tiene la versión más nueva.
+function mergeSnapshot(msg, peerId) {
+  const now = Date.now();
+  let adopted = 0;
+  for (const r of Array.isArray(msg.players) ? msg.players : []) {
+    if (!r || (typeof r.userId !== 'string' && typeof r.userId !== 'number') || !isFresh(r.ver, now)) continue;
+    const userId = String(r.userId);
+    const live = players.get(userId);
+    // Carrera al arrancar: el jugador se reconectó aquí con una copia vieja
+    // del disco ANTES de que llegara la del par, que es más nueva. Se lo
+    // corrige a la más nueva (pocos segundos después de reconectarse).
+    if (live && isLocal(live) && live.restoredAt && now - live.restoredAt < 15000 && !r.deleted
+        && r.ver > live.restoredFromVer && isFiniteNum(r.x) && isFiniteNum(r.y)) {
+      live.x = clampX(r.x); live.y = clampY(r.y);
+      const round = match.phase === 'waiting' && paused ? paused.round : match.round;
+      if (r.round === round && Number.isInteger(r.score)) live.score = r.score;
+      live.restoredFromVer = r.ver;
+      console.log(`[persistencia] ${live.username}: ${peerId} tenía una copia más nueva, se corrige a (${Math.round(live.x)}, ${Math.round(live.y)})`);
+      adopted++;
+      continue;
+    }
+    if (live && live.owner !== null) continue;
+    const mine = live ? live.ver || 0 : (saved.get(userId) || {}).ver || 0;
+    if (r.ver <= mine) continue;
+    const rec = r.deleted ? { userId, username: String(r.username || ''), ver: r.ver, deleted: true }
+      : { userId, username: String(r.username || '').slice(0, 32), provider: r.provider === 'google' ? 'google' : 'local',
+        vehicle: r.vehicle === 'uber' ? 'uber' : 'taxi', x: Number(r.x), y: Number(r.y), angle: Number(r.angle) || 0,
+        score: Number.isInteger(r.score) ? r.score : 0, round: Number.isInteger(r.round) ? r.round : 0,
+        extras: r.extras && typeof r.extras === 'object' && !Array.isArray(r.extras) ? r.extras : {}, ver: r.ver };
+    if (live) {
+      // Jugador en espera (su coordinador se cayó): la copia del par es más nueva
+      if (!rec.deleted && isFiniteNum(rec.x) && isFiniteNum(rec.y)) { live.x = clampX(rec.x); live.y = clampY(rec.y); live.ver = rec.ver; }
+    } else {
+      saved.set(userId, rec);
+    }
+    adopted++;
+  }
+  // Partida: gana la más avanzada, si es reciente
+  const m = msg.match;
+  if (m && ['waiting', 'playing', 'ended'].includes(m.phase) && isFiniteNum(m.savedAt) && now - m.savedAt < MATCH_RESUME_MS
+      && matchProgress(m) > matchProgress(matchRecord(now)) && m.phase !== 'waiting') {
+    if (match.phase === 'waiting') {
+      paused = { round: m.round, phase: m.phase, remainingMs: Math.max(0, m.remainingMs || 0), result: m.result || null, pausedAt: m.savedAt };
+      match.round = Math.max(match.round, m.round);
+    } else if (!mesh || mesh.isLeader()) {
+      match.round = m.round; match.phase = m.phase; match.endsAt = now + Math.max(0, m.remainingMs || 0); match.result = m.result || null;
+      sendWorldSync();
+    }
+    if (msg.passenger && isFiniteNum(msg.passenger.x) && isFiniteNum(msg.passenger.y)) passenger = { x: msg.passenger.x, y: msg.passenger.y };
+    console.log(`[persistencia] ${peerId} tenía la partida más avanzada (ronda ${m.round}, ${m.phase}): se adopta`);
+  }
+  chat.merge(msg.chat, msg.chatSeq);
+  if (adopted) console.log(`[persistencia] ${adopted} jugador(es) más recientes en lo guardado de ${peerId}`);
+}
+
+let store = null;
+let persistTimer = null;
+function persist() {
+  if (!store) return;
+  const now = Date.now();
+  const list = [];
+  for (const [userId, p] of players) list.push(toRecord(userId, p));
+  for (const [userId, r] of saved) if (!players.has(userId)) list.push(r);
+  try {
+    store.save({
+      players: list,
+      world: { match: matchRecord(now), passenger, chat: { messages: chat.history(), lastSeq: chat.lastSeq() } },
+      minVer: now - SAVED_TTL_MS,
+    });
+  } catch (err) {
+    console.error(`[persistencia] no se pudo guardar en ${STATE_DB}: ${err.message}`);
+  }
+}
+
+// Al arrancar: recuperar lo último guardado
+function restoreState() {
+  try {
+    store = createStore(STATE_DB);
+  } catch (err) {
+    console.error(`[persistencia] no se pudo abrir ${STATE_DB}: ${err.message} (sigue sin persistencia)`);
+    return;
+  }
+  const now = Date.now();
+  let n = 0;
+  for (const r of store.loadPlayers()) {
+    if (!isFresh(r.ver, now)) continue;
+    saved.set(String(r.userId), r);
+    n++;
+  }
+  const m = store.loadWorld('match');
+  if (m && Number.isInteger(m.round)) {
+    match.round = m.round;
+    if (m.phase !== 'waiting' && isFiniteNum(m.savedAt) && now - m.savedAt < MATCH_RESUME_MS) {
+      paused = { round: m.round, phase: m.phase, remainingMs: Math.max(0, m.remainingMs || 0), result: m.result || null, pausedAt: m.savedAt };
+    }
+  }
+  const pas = store.loadWorld('passenger');
+  if (pas && isFiniteNum(pas.x) && isFiniteNum(pas.y) && !collides(pas.x, pas.y, PASSENGER_RADIUS, city.obstacles)) passenger = pas;
+  const c = store.loadWorld('chat');
+  if (c) chat.merge(c.messages, c.lastSeq);
+  if (n || paused) {
+    console.log(`[persistencia] recuperado de ${STATE_DB}: ${n} jugador(es)`
+      + (paused ? `, ronda ${paused.round} pausada (quedan ${Math.round(paused.remainingMs / 1000)} s)` : '')
+      + `, ${chat.history().length} mensajes de chat`);
+  }
+  persistTimer = setInterval(persist, PERSIST_MS);
+}
+restoreState();
+
+// Ctrl+C / kill: último guardado antes de salir (si el proceso muere de golpe
+// se pierde a lo sumo PERSIST_MS)
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => {
+    persist();
+    process.exit(0);
+  });
+}
+
 let rebalanceTimer = null;
 if (AUTH_URL && (process.env.MESH || 'on').trim().toLowerCase() !== 'off') {
   rebalanceTimer = setInterval(rebalance, REBALANCE_MS);
   mesh = createMesh({
     id: COORDINATOR_ID, peerPort: MESH_SHARED_PORT ? null : PEER_PORT, publicUrl: PUBLIC_URL, peerUrl: PEER_URL,
-    authUrl: AUTH_URL, secret: JWT_SECRET, startedAt: STARTED_AT,
-    getConnectedPlayers: localCount,
+    auth: authPool, secret: JWT_SECRET, startedAt: STARTED_AT,
+    getConnectedPlayers: localCount, getSpectators: () => spectators.size,
     onMessage: onPeerMessage, onPeerUp, onPeerDown,
   });
 }
 
 server.listen(PORT, () => {
   console.log(`Coordinador en puerto ${PORT} (${COORDINATOR_ID}, game loop a ${TICK_RATE} Hz, mundo ${WORLD_WIDTH}x${WORLD_HEIGHT}, ${city.obstacles.length} estructuras)`);
-  if (mesh) console.log(`  mesh: pares en ${PEER_URL}, clientes en ${PUBLIC_URL}, directorio ${AUTH_URL}`);
+  if (mesh) console.log(`  mesh: pares en ${PEER_URL}, clientes en ${PUBLIC_URL}, directorio ${AUTH_URLS.join(', ')}`);
   else console.log('  sin AUTH_URL: funciona solo (sin directorio ni mesh)');
 });
