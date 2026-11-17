@@ -5,10 +5,14 @@ const express = require('express');
 const path = require('path');
 
 const PORT = process.env.PORT || 3000;
-const AUTH_URL = process.env.AUTH_URL || 'http://localhost:4000';
+// Taller 7: varios auth replicados, separados por coma. AUTH_URL (uno solo)
+// sigue funcionando como antes.
+const splitUrls = (raw) => (raw || '').split(',').map((u) => u.trim()).filter(Boolean);
+const AUTH_URLS = splitUrls(process.env.AUTH_URLS || process.env.AUTH_URL || 'http://localhost:4000');
 const COORDINATOR_WS = process.env.COORDINATOR_WS || 'ws://localhost:5000';
 // URLs públicas (ngrok). Si faltan, se usan las locales.
-const PUBLIC_AUTH_URL = process.env.PUBLIC_AUTH_URL || AUTH_URL;
+const PUBLIC_AUTH_URLS = splitUrls(process.env.PUBLIC_AUTH_URLS || process.env.PUBLIC_AUTH_URL);
+if (!PUBLIC_AUTH_URLS.length) PUBLIC_AUTH_URLS.push(...AUTH_URLS);
 const PUBLIC_COORDINATOR_WS = process.env.PUBLIC_COORDINATOR_WS || COORDINATOR_WS;
 // Client ID de OAuth: es público (va en el botón de Google), el mismo que usa auth-service.
 // Si el .env viene del Taller 1 (sin GOOGLE_CLIENT_ID) se toma el del .env.example.
@@ -39,8 +43,8 @@ function isLocal(req) {
 // el túnel de ngrok usa las URLs públicas (https:// y wss://).
 app.get('/config.js', (req, res) => {
   const config = isLocal(req)
-    ? { AUTH_URL, COORDINATOR_WS, GOOGLE_CLIENT_ID }
-    : { AUTH_URL: PUBLIC_AUTH_URL, COORDINATOR_WS: PUBLIC_COORDINATOR_WS, GOOGLE_CLIENT_ID };
+    ? { AUTH_URLS, AUTH_URL: AUTH_URLS[0], COORDINATOR_WS, GOOGLE_CLIENT_ID }
+    : { AUTH_URLS: PUBLIC_AUTH_URLS, AUTH_URL: PUBLIC_AUTH_URLS[0], COORDINATOR_WS: PUBLIC_COORDINATOR_WS, GOOGLE_CLIENT_ID };
   res.type('application/javascript');
   res.set('Cache-Control', 'no-store');
   res.send(`window.APP_CONFIG = ${JSON.stringify(config)};`);
@@ -57,6 +61,6 @@ app.get('/vendor/three.min.js', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Cliente en puerto ${PORT}`);
-  console.log(`  local:   AUTH_URL=${AUTH_URL}  COORDINATOR_WS=${COORDINATOR_WS}`);
-  console.log(`  público: AUTH_URL=${PUBLIC_AUTH_URL}  COORDINATOR_WS=${PUBLIC_COORDINATOR_WS}`);
+  console.log(`  local:   AUTH_URLS=${AUTH_URLS.join(',')}  COORDINATOR_WS=${COORDINATOR_WS}`);
+  console.log(`  público: AUTH_URLS=${PUBLIC_AUTH_URLS.join(',')}  COORDINATOR_WS=${PUBLIC_COORDINATOR_WS}`);
 });
