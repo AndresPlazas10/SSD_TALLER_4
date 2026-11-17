@@ -27,6 +27,7 @@ test('migra la tabla users del Taller 1 a provider = local', () => {
     DB_FILE,
     JWT_SECRET: crypto.randomBytes(32).toString('hex'),
     GOOGLE_CLIENT_ID: 'test-client.apps.googleusercontent.com',
+    AUTH_PEERS: '',
   });
   const { db } = require('../index.js');
   try {

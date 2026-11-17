@@ -14,7 +14,7 @@ const JWT_SECRET = crypto.randomBytes(32).toString('hex');
 const TTL = 400;
 Object.assign(process.env, {
   DB_FILE, JWT_SECRET, GOOGLE_CLIENT_ID: 'test-client.apps.googleusercontent.com',
-  JWT_EXPIRES_IN: '1h', DIRECTORY_TTL_MS: String(TTL),
+  JWT_EXPIRES_IN: '1h', DIRECTORY_TTL_MS: String(TTL), AUTH_PEERS: '',
 });
 const { app, db, coordinators } = require('../index.js');
 
@@ -134,7 +134,7 @@ test('GET /peers: lista los vivos con su peerUrl', async () => {
   await heartbeat('coord-a', 0);
   await heartbeat('coord-b', 0);
   await heartbeat('coord-c', 0);
-  const r = await get('/peers');
+  const r = await get('/peers?type=coordinators');
   assert.deepStrictEqual(r.data, { peers: [
     { coordinatorId: 'coord-a', peerUrl: 'ws://localhost:5101' },
     { coordinatorId: 'coord-b', peerUrl: 'ws://localhost:5102' },

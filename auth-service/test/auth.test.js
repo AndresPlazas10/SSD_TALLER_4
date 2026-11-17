@@ -13,7 +13,7 @@ const jwt = require('jsonwebtoken');
 const DB_FILE = path.join(os.tmpdir(), `auth-test-${process.pid}.db`);
 const JWT_SECRET = crypto.randomBytes(32).toString('hex');
 const GOOGLE_CLIENT_ID = 'test-client.apps.googleusercontent.com';
-Object.assign(process.env, { DB_FILE, JWT_SECRET, GOOGLE_CLIENT_ID, BCRYPT_ROUNDS: '10', JWT_EXPIRES_IN: '1h' });
+Object.assign(process.env, { DB_FILE, JWT_SECRET, GOOGLE_CLIENT_ID, BCRYPT_ROUNDS: '10', JWT_EXPIRES_IN: '1h', AUTH_PEERS: '' });
 
 const { app, db, googleClient } = require('../index.js');
 
