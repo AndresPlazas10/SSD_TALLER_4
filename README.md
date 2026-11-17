@@ -1,6 +1,308 @@
-# SSD Taller 6 — Proyecto Final Parte III: coordinadores en mesh (sobre la Parte II: juego en vivo + login con Google)
+# Uber vs Taxi — juego multijugador distribuido (Proyecto final de Sistemas Distribuidos)
 
-Videojuego web multijugador **Uber vs Taxi** del curso de Sistemas Distribuidos. La Parte I (Taller 4) dejó registro, login con JWT y lobby en tiempo real. La **Parte III (Taller 6)** reparte el juego entre **varios coordinadores en mesh** (sección 0). La Parte II agregó:
+Juego web en tiempo real: conductores **Uber** y **Taxi** recorren una ciudad en 3D y compiten por equipos recogiendo pasajeros en rondas de 3 minutos. El juego es la excusa; el proyecto es el sistema distribuido de abajo:
+
+- **Autenticación replicada**: 3 `auth-service` con un líder elegido (estilo Raft) y replicación de un solo escritor. Login local y con Google; ambos emiten el mismo JWT.
+- **Coordinadores en mesh**: 3 `coordinator` intercambiables. Simulan el mundo con un **servidor autoritativo** a 20 Hz, se replican entre sí por WebSocket y sobreviven a la caída de cualquiera.
+- **Cliente sin estado de juego**: solo manda intenciones y dibuja. Conoce la lista de servidores: **sin proxy reverso** y **sin sticky sessions**.
+- **Tracks del examen final**:
+  - **2.1 Persistencia** (principal): el mundo sobrevive aunque se caigan los 3 coordinadores.
+  - **2.6 Chat distribuido** (secundario): orden total entre coordinadores.
+  - **2.5 Espectador** (extra): mirar sin cuenta.
+
+Todo con `express`, `ws`, `node:sqlite`, `jsonwebtoken`, `bcryptjs` y `google-auth-library`. Nada de Redis, Kafka ni librerías de consenso.
+
+**Índice**:
+- [Arquitectura](#arquitectura)
+- [Modelo de consistencia](#quién-manda-sobre-qué-modelo-de-consistencia)
+- [Gameplay](#gameplay-uber-vs-taxi)
+- [Track 2.1 Persistencia](#track-21-persistencia-del-estado-del-juego-principal)
+- [Track 2.6 Chat](#track-26-chat-distribuido-secundario)
+- [Track 2.5 Espectador](#track-25-modo-espectador-extra)
+- [Modos de falla](#modos-de-falla-conocidos)
+- [Cómo levantarlo](#cómo-levantarlo)
+- [Restricciones del enunciado](#restricciones-del-enunciado)
+- [Tests](#tests)
+- [Apéndice: detalle por taller](#apéndice-detalle-de-cada-parte)
+
+---
+
+## Arquitectura
+
+```
+                         Navegador (client/public: login.html, lobby.html, auth-client.js)
+                          │  conoce AUTH_URLS (lista)           │  WS directo al coordinador
+             HTTP (JWT)   │  y pide a qué coordinador ir        │  que le asignó el directorio
+        ┌─────────────────┼────────────────┐                    │
+        ▼                 ▼                ▼                    ▼
+   ┌─────────┐       ┌─────────┐      ┌─────────┐     ┌──────────────────────────────────────┐
+   │ auth-a  │◀─WS──▶│ auth-b  │◀─WS─▶│ auth-c  │     │ coord-a ◀──WS mesh──▶ coord-b         │
+   │ LÍDER   │       │ réplica │      │ réplica │     │    ▲                    ▲             │
+   │users.db │       │users.db │      │users.db │     │    └────── coord-c ─────┘             │
+   └────▲────┘       └─────────┘      └─────────┘     │ cada uno: game loop 20 Hz + state.db  │
+        │   heartbeat 2 s (directorio) + /peers        └──────────────┬───────────────────────┘
+        └─────────────────────────────────────────────────────────────┘
+```
+
+| Componente | Proceso | Responsabilidad | Estado que guarda |
+|---|---|---|---|
+| `auth-service/` | 3 instancias (4000-4002; cluster WS 4100-4102 o `/mesh`) | Registro, login local y Google, emitir JWT. **Directorio** de coordinadores (heartbeats, `GET /coordinator` = el menos cargado). Replicación líder/réplica de usuarios | `users.db` por nodo (usuarios + log de replicación). Directorio en memoria (estado blando) |
+| `coordinator/` | 3 instancias (5001-5003; mesh WS en el mismo puerto o +100) | Valida el JWT en el `upgrade`, **simula el juego** (movimiento, choques, pasajero, rondas), replica a sus pares, chat, espectadores | En memoria (el mundo) y **`state-<id>.db`** (persistencia, track 2.1) |
+| `client/` | 1 (3000) | Sirve las páginas y `/config.js` con las listas de URLs. Three.js para la vista 3D | Nada (token en `localStorage`) |
+
+**Flujo de una partida**:
+1. El navegador hace login contra cualquier auth. Una escritura en una réplica recibe `503 not_leader` con `leaderUrl` y se reintenta en el líder. El auth devuelve un JWT firmado con la secret compartida.
+2. Pide `GET /coordinator` (el menos cargado) y abre `wss://coord/connect?token=…`.
+3. El coordinador valida el JWT en el handshake (sin consultar al auth: no hay sesiones del lado del auth).
+4. El cliente solo manda `intent` (dirección -1/0/1) cuando cambia una tecla. El coordinador integra el movimiento en su tick y manda un `state` por tick.
+5. El coordinador replica a los demás:
+   - `intent_replicate` y `player_sync` (10 Hz): el **dueño** de cada jugador manda sobre su posición;
+   - `world_sync`: el **líder del mesh** manda sobre el pasajero, la ronda y los puntajes.
+
+## Quién manda sobre qué (modelo de consistencia)
+
+| Dato | Autoridad | Cómo se replica | Si se cae la autoridad |
+|---|---|---|---|
+| Usuarios (registro) | Auth **líder** (uno a la vez) | Log numerado y encadenado por hash, `write_propagate`. **Opción B**: se responde 201 cuando una réplica confirmó | Elección en ~6-8 s. Lo confirmado no se pierde (gana el log más nuevo) |
+| Login (lectura) | Cualquier auth | — | Otro auth de `AUTH_URLS` |
+| Directorio de coordinadores | Auth líder (se copia a réplicas en su heartbeat) | Estado blando: los coordinadores se reanuncian cada 2 s | Una réplica lo sigue sirviendo |
+| Posición de un jugador | Su coordinador (**dueño**) | `player_sync` 10 Hz con versión (HLC) | Los demás lo dejan **en espera** 15 s. Se reconecta a otro y sigue donde estaba |
+| Pasajero, ronda, puntajes | **Líder del mesh** (coordinador vivo más antiguo) | `world_sync` cada 500 ms y en cada evento | El siguiente más antiguo pasa a ser líder |
+| Chat (orden) | **Líder del mesh** (secuenciador) | `chat_submit` → `chat_ordered` con `seq` | Lo pendiente se reenvía al líder nuevo, sin duplicados |
+| Estado guardado | Cada coordinador en su SQLite | Snapshot al formar el mesh: por jugador **gana la versión mayor** | Se recupera del disco al arrancar |
+
+## Gameplay: Uber vs Taxi
+
+No es "mover un círculo". Todo lo decide el servidor y se replica entre coordinadores:
+
+- **Equipos**: el bando (Uber o Taxi) se elige al registrarse y viaja **firmado en el JWT**, así que el cliente no lo puede cambiar.
+- **Ciudad con colisiones**: 108 manzanas por barrios. Los autos chocan con las manzanas y entre sí.
+- **Pasajero compartido**: el primer auto que lo toca suma un punto para su equipo y aparece otro. La recogida la decide el líder del mesh y se replica (`pickup_replicate`).
+- **Rondas de 3 min** con marcador por equipo, ganador, podio y una ronda nueva. Con la persistencia, la ronda **se pausa** si se van todos y **se reanuda** donde iba.
+
+Detalle en [8.1 La ciudad](#81-la-ciudad-manzanas-uber-vs-taxi-y-pasajero).
+
+---
+
+## Track 2.1: Persistencia del estado del juego (principal)
+
+**Código:** `coordinator/persistence.js`, y la sección "Persistencia" de `coordinator/index.js`.
+
+### Qué se guarda
+
+Cada coordinador escribe cada `PERSIST_MS` (2 s), en **su propia SQLite** (`state-<id>.db`) y en **una transacción**:
+- todos los jugadores que conoce (los suyos y las copias de los demás): posición, ángulo, extras, pasajeros, ronda y **versión**;
+- los que cerraron sesión, como **tombstone**;
+- la partida (ronda, fase, tiempo restante), el pasajero y los últimos 50 mensajes del chat.
+
+Al recibir **Ctrl+C** guarda una vez más antes de salir. Si el proceso muere de golpe, se pierden a lo sumo 2 s.
+
+### Recuperar al arrancar
+
+Lo guardado (de menos de `SAVED_TTL_MS`, 10 min) se carga en `saved`. Los jugadores **no** aparecen como fantasmas: cada uno vuelve **cuando se reconecta**.
+- El cliente se reconecta solo, sin recargar la página.
+- El coordinador lo pone donde quedó, con sus pasajeros si es la misma ronda.
+- `welcome` trae `restored: true` y la página avisa "Volviste donde habías quedado".
+
+La ronda queda **pausada** con el tiempo que le faltaba y se **reanuda** (`match_resume`) cuando vuelve el primer jugador.
+
+### Reconciliar al formar el mesh
+
+Cuando dos coordinadores se conectan, cada uno le manda al otro su `state_snapshot`. Por jugador **gana la versión mayor**, y un jugador que ya está conectado en algún coordinador no se toca, porque su dueño lo publica en vivo. La partida que gana es la **más avanzada** (ronda y tiempo transcurrido, sin usar relojes).
+
+### Lo difícil, y cómo lo resolvimos
+
+- **¿Cuál gana si dos coordinadores recuperan un estado distinto del mismo jugador?** El de **versión mayor**. La versión es un **reloj lógico híbrido**: `ver = max(Date.now() del dueño, verAnterior + 1)`.
+  - Solo la sube el coordinador **dueño**, cada vez que publica la posición.
+  - Las copias de los demás guardan la versión que recibieron.
+  - Cuando el jugador se muda de coordinador, el nuevo dueño parte de la versión heredada + 1.
+  - Resultado: la versión mayor es la última en la cadena de dueños, aunque los relojes de los equipos estén corridos unos segundos.
+- **¿Y si un coordinador tiene un estado "más nuevo que la realidad" porque el otro murió hace 5 minutos?**
+  - El que murió hace 5 minutos tiene **versiones viejas**: su última actualización es de hace 5 minutos. Los que siguieron vivos tienen versiones de hace segundos, así que pierde. Lo prueba un test: coord-c muere, alicia se mueve, mueren los otros dos, vuelven los tres, alicia entra justo por coord-c… y aparece en la posición nueva.
+  - Si el que murió antes tenía a alguien que **después cerró sesión**, el tombstone (versión mayor) impide que la copia vieja lo "resucite".
+  - Lo de más de 10 min no se usa (`SAVED_TTL_MS`). Una partida pausada más de 10 min no se reanuda: empieza otra (`MATCH_RESUME_MS`).
+- **Carrera al arrancar**: un cliente puede reconectarse a un coordinador recién levantado **antes** de que le llegue el snapshot de un par con una copia más nueva. Si llega en los 15 s siguientes, se corrige al jugador a la copia más nueva (log `coord-b tenía una copia más nueva, se corrige`).
+- **Cerrar sesión ≠ cerrar la pestaña**:
+  - El botón "Cerrar sesión" cierra el WS con `1000 'logout'`. Se guarda un tombstone y la próxima vez se arranca de cero.
+  - Cerrar la pestaña o perder la red guarda el lugar: al volver, se sigue ahí.
+
+**Supuesto**: los relojes de los equipos sincronizados con NTP, con diferencias de segundos (Windows lo hace por defecto). Con relojes corridos varios minutos, la regla de la versión mayor podría preferir la copia del equipo adelantado. Se documenta como límite.
+
+### Demo
+
+1. alice en x≈400 con 2 pasajeros.
+2. Ctrl+C a los 3 coordinadores y se vuelven a levantar.
+3. La página de alice se reconecta sola y aparece en x≈400 con sus 2 pasajeros, en la misma ronda y con el tiempo que le quedaba.
+4. `GET http://coord:5001/status` muestra a cada jugador con su `ver` y su estado: conectado aquí, en otro coordinador, en espera, guardado o cerró sesión.
+
+En la prueba con un Edge real volvió a **0,0 px** de donde estaba.
+
+---
+
+## Track 2.6: Chat distribuido (secundario)
+
+**Código:** `coordinator/chat.js`, más el panel 💬 de `lobby.html`.
+
+- **Envío**: el cliente manda `{ type: "chat", text }` a su coordinador.
+  - El coordinador lo valida: texto de 1 a 200 caracteres. Quita los **caracteres de control** y los invisibles o bidi (U+202E y similares, que sirven para disfrazar texto).
+  - Aplica el rate limit **por usuario** (reconectarse no lo reinicia): ráfaga de 5 y después 1 cada 1,5 s.
+  - Quien insiste con el límite agotado queda **silenciado 30 s**. Un script de 1000 mensajes/s no ensucia el chat de nadie.
+  - Los errores vuelven como `chat_error { reason: rate_limited | muted | too_long | empty }`.
+- **Orden (lo difícil): orden total con secuenciador**.
+  - El coordinador de origen manda el mensaje al **líder del mesh** (`chat_submit`).
+  - El líder le asigna el siguiente `seq` y lo reparte a todos (`chat_ordered`).
+  - Cada coordinador entrega a sus clientes **por `seq`, no por orden de llegada**. Guarda en un búfer lo que llega adelantado.
+  - Si Alice (coord-a) escribe "hola" y Bob (coord-b) escribe "qué tal" a los pocos ms, Charlie (coord-c) los ve en el orden en que llegaron al líder, **el mismo orden que ven Alice y Bob**. No se usan los relojes de los equipos.
+  - Elegimos esto, y no ordenar por timestamp, porque con relojes desfasados el orden por timestamp puede diferir entre clientes, y un mensaje "atrasado" obligaría a reordenar lo ya mostrado.
+- **Caída del líder**:
+  - Lo que quedó sin numerar lo reenvía su coordinador de origen al líder nuevo. Cada mensaje tiene un id único y los repetidos se descartan.
+  - El líder nuevo sigue numerando desde el mayor `seq` que vio.
+  - Si el líder murió a mitad de un envío y queda un hueco, se espera 1,5 s y se salta.
+  - **Atajo documentado**: en ese caso raro, un coordinador podría ver un mensaje con otro número que los demás. El orden relativo del resto se mantiene.
+- **Historial**: cada coordinador guarda los últimos 50 mensajes en memoria, y también en su SQLite, gracias al track 2.1.
+  - Un cliente recién conectado los recibe en `chat_history`.
+  - Un coordinador que entra al mesh los recibe en el snapshot.
+- **XSS**: el cliente dibuja todo con `textContent`. Un mensaje `<img src=x onerror=alert(1)>` se ve como texto y nunca se ejecuta.
+
+**Demo**:
+1. Tres navegadores en coord-a, coord-b y coord-c escriben a la vez. Los tres ven la misma secuencia; el tooltip de cada mensaje muestra `#seq`, el coordinador de origen y quién lo numeró.
+2. Mandar 10 mensajes seguidos: al 6º aparece "Más despacio" y después "Silenciado 30 s".
+
+---
+
+## Track 2.5: Modo espectador (extra)
+
+**Código:** `onSpectator` en `coordinator/index.js`, y `lobby.html?spectate`.
+
+- **Endpoint**: `wss://coord/spectate` acepta conexiones **sin token**. El espectador recibe `welcome` (con `spectator: true` y `you: null`), el `state`, los eventos y el chat.
+- **Solo lectura**: todo lo que manda se ignora sin romper nada (`intent`, `extras_update`, `chat`, JSON inválido). Recibe `spectator_ignored` y el coordinador lo registra en el log. Si manda más de 30 mensajes en 1 s, se lo desconecta.
+- **Vista**: `lobby.html?spectate`, enlazada desde el login ("Ver la partida como espectador").
+  - Cartel fijo **MODO ESPECTADOR**.
+  - Sin controles de manejo, de color ni de chat para escribir (sí lee el chat).
+  - Cámara de la ciudad, o clic en un conductor para seguirlo.
+- **No cuenta para el balanceo**: los espectadores no están en `connectedPlayers`. El heartbeat los reporta aparte (`spectators`), y el directorio los reparte con `GET /coordinator?role=spectator`, según quién tiene **menos espectadores**.
+- **Lo difícil: el costo de 1000 espectadores**. Lo atacamos con tres cosas:
+  1. El `state` se serializa **una vez por tick** y se manda el mismo texto a todos: el costo es enviar, no armar el JSON.
+  2. Los espectadores lo reciben a **10 Hz** (`SPECTATOR_EVERY=2`), la mitad que un jugador. Para mirar alcanza, porque el cliente interpola.
+  3. **Máximo por coordinador** (`MAX_SPECTATORS=50`). El siguiente recibe el cierre `4013` y el cliente pide otro coordinador. Además, un espectador lento (más de 256 KB sin enviar) se salta estados en vez de acumular memoria.
+
+  No pusimos un coordinador especial de espectadores: el directorio ya los reparte entre todos, y un coordinador dedicado sería un punto único de falla. Para escalar más allá de 50 × N, se agregan coordinadores.
+
+**Demo**:
+1. Una pestaña como espectador (sin login) y otra como jugador. El espectador ve moverse al jugador.
+2. En la consola del espectador: `gameSocket.send(JSON.stringify({ type: 'intent', intent: { dir: { x: 1, y: 0 } } }))`.
+3. El coordinador registra `mensaje "intent" ignorado: los espectadores son de solo lectura` y nadie se mueve.
+
+**Por qué tres tracks**: el chat es un track acotado. Los dos de menos peso (chat y espectador) se apoyan en la misma maquinaria que la persistencia: el mesh, el líder y la SQLite. Los tres tienen tests de integración con procesos reales.
+
+---
+
+## Modos de falla conocidos
+
+| Falla | Qué pasa | Recuperación |
+|---|---|---|
+| Se cae un coordinador | Sus jugadores quedan **en espera** 15 s en los demás, con su posición y sus pasajeros | El cliente detecta el corte (cierre del WS, o 3,5 s sin datos), pide otro coordinador (`?exclude=`) y sigue donde estaba. Sin recargar la página |
+| Se caen los 3 coordinadores | Nadie juega mientras están abajo | Al volver: estado desde la SQLite, ronda reanudada, los clientes reconectan solos (track 2.1) |
+| Se cae el auth líder | Las escrituras devuelven `503 no_leader` unos 6-8 s. Login y directorio siguen en las réplicas | Elección: gana la réplica con el log más nuevo. Los coordinadores siguen al líder nuevo y el cliente reintenta solo |
+| Quedan 1 de 3 auth | No se puede registrar (`no_quorum` / `no_leader`); el login y el juego siguen | Volver a levantar un auth |
+| Partición del mesh (A no ve a B) | Cada lado puede elegir su propio líder del mesh: el pasajero y la ronda divergen mientras dure | Al reconectarse vuelve a haber un solo líder (el más antiguo) y su `world_sync` se impone. **Límite conocido**: no hay quórum en el mesh de coordinadores |
+| Líder del mesh cae con chat sin numerar | Esos mensajes se reenvían al líder nuevo | Ver track 2.6. Un hueco se salta a los 1,5 s |
+| Relojes desfasados entre equipos | Juego y chat no dependen del reloj: se manda el tiempo restante, no la hora | Persistencia: con un desfase de minutos podría ganar la copia del equipo adelantado (usar NTP) |
+| Túnel ngrok caído | El auth o coordinador detrás de él queda inalcanzable | Igual que una caída: failover a otro de la lista |
+| Cliente malicioso (DevTools) | Intents saneados a -1/0/1, `maxPayload` de 4 KB, extras de hasta 1 KB, chat con rate limit, espectador de solo lectura | — |
+| SQLite corrupta o sin permisos | El coordinador avisa y sigue **sin persistencia** | Se recupera del snapshot de sus pares al formar el mesh |
+
+---
+
+## Cómo levantarlo
+
+**Requisitos**: Node.js ≥ 22.5 (usa `node:sqlite`) y `npm run install:all` en la raíz (o `npm install` en cada carpeta).
+
+**Todo en un equipo** (desarrollo o demo):
+
+```bash
+cp auth-service/.env.example auth-service/.env   # poner una JWT_SECRET de 32+ caracteres
+npm run local          # 3 auth (4000-4002) + 3 coordinadores (5001-5003) + cliente (3000)
+npm run local:light    # 1 auth + 2 coordinadores, para equipos con poca RAM
+```
+
+Abrir http://localhost:3000 para jugar y http://localhost:3000/lobby.html?spectate para mirar. Ctrl+C detiene todo; los coordinadores guardan su estado al salir.
+
+**Tres equipos y ngrok**:
+- Cada equipo corre su parte con su `.env`; la JWT_SECRET es **la misma** en todos.
+- Auth: `AUTH_PEERS` (la misma lista en los tres), `AUTH_ID` y `PUBLIC_URL` de su túnel.
+- Coordinadores: `AUTH_URLS` (los tres auth) y `PUBLIC_URL`/`PEER_URL` de su túnel.
+- Cliente: `AUTH_URLS` / `PUBLIC_AUTH_URLS`.
+- Con ngrok basta **un túnel por proceso**: el cluster de auth entra por `/mesh` y el mesh de coordinadores por la raíz del mismo puerto.
+
+Pasos detallados: [IV.7](#iv7-levantar-los-tres-auth), [0.6 ngrok](#06-despliegue-con-ngrok-un-túnel-por-equipo) y [4. Despliegue en tres equipos](#4-despliegue-en-tres-equipos).
+
+| Endpoint útil | Para qué |
+|---|---|
+| `GET auth/status` | Rol (líder o réplica), term, `lastAppliedSeq`, usuarios |
+| `GET auth/coordinators` | Coordinadores vivos con sus jugadores y espectadores |
+| `GET coord/health` | Pares del mesh, líder, jugadores, espectadores, `chatSeq`, ronda |
+| `GET coord/status` | Cada jugador con posición, versión y estado (para la demo de persistencia) |
+
+## Restricciones del enunciado
+
+| Restricción | Cómo se cumple |
+|---|---|
+| Servidor autoritativo | El cliente manda dirección -1/0/1; posición, choques, pasajero y rondas los calcula el coordinador |
+| Sin Redis, Kafka ni librerías de consenso | Elección y replicación escritas a mano (`auth-service/replication.js`), mesh con `ws`, SQLite con `node:sqlite` |
+| JWT con secret compartida, sin sesiones en el auth | El coordinador valida la firma localmente. El auth no guarda sesiones (solo usuarios) |
+| Sin proxy reverso; el cliente conoce la lista | `AUTH_URLS` en el cliente y los coordinadores. El directorio solo **dice** a qué coordinador ir, no reenvía tráfico |
+| Sin sticky sessions | Cualquier coordinador acepta a cualquier jugador. La sesión se mueve entre coordinadores (failover, balanceo) conservando el estado |
+
+## Tests
+
+```bash
+npm test     # en la raíz: auth-service y coordinator
+```
+
+- `auth-service`: endpoints, Google (con stub y con la verificación real), migraciones, directorio y el **cluster de 3 auth reales** (elección, replicación, failover, sync, `no_quorum`).
+- `coordinator`: game loop y validaciones; mesh de 3 coordinadores reales; failover del auth con coordinadores; y **`test/final.test.js`** con los tres tracks:
+  - el chat en el mismo orden en 3 coordinadores, el rate limit y el filtrado;
+  - el espectador de solo lectura, sin contar en el balanceo y con su límite;
+  - matar los 3 coordinadores y volver al mismo lugar, que la copia vieja pierda y el tombstone.
+
+Detalle en [12. Tests automáticos](#12-tests-automáticos). Hoy: **auth 43/43, coordinator 49/49**.
+
+## Guion de la sustentación final
+
+Abrir antes: el juego en **dos navegadores distintos** (o una ventana normal y otra de incógnito, porque `localStorage` se comparte entre pestañas), una pestaña de espectador y las consolas de los procesos.
+
+1. **Demos críticas (5 min)**:
+   - **Login con Google**: "Acceder con Google", elegir username y bando.
+   - **Autoridad del servidor**: en DevTools reescribir `lastState`; solo cambia la pantalla propia y el siguiente tick lo corrige. Ver [13](#13-guion-de-la-sustentación).
+   - **Failover de coordinador**: Ctrl+C al coordinador de un jugador. Sigue jugando en otro sin recargar, en el mismo lugar y con sus pasajeros.
+   - **Failover de auth**: Ctrl+C al auth líder. `GET /status` muestra la elección; registrar a bob funciona con el líder nuevo. Ver [IV.8](#iv8-guion-de-la-sustentación-taller-7).
+2. **Tracks**:
+   - **2.1**: alice en un lugar concreto (`GET coord/status` muestra su `x`). Ctrl+C a los 3 coordinadores, se vuelven a levantar y alice aparece ahí, con sus pasajeros y la ronda reanudada.
+   - **2.6**: tres clientes en tres coordinadores escriben a la vez y todos ven el mismo orden (tooltip `#seq`). Diez mensajes seguidos disparan el rate limit.
+   - **2.5**: `lobby.html?spectate` sin login. En su consola, `gameSocket.send(JSON.stringify({ type: 'intent', intent: { dir: { x: 1, y: 0 } } }))`: el coordinador lo ignora y lo registra en el log.
+3. **Gameplay (3 min)**: Uber vs Taxi. Bandos firmados en el JWT, pasajero compartido decidido por el líder del mesh, rondas con marcador y podio, choques. Todo en el servidor y replicado entre coordinadores.
+4. **Cada integrante explica una pieza**:
+   - auth replicado y elección;
+   - mesh, dueños y líder;
+   - persistencia y versiones;
+   - chat y secuenciador;
+   - cliente (interpolación, failover, espectador).
+5. **Cierre: qué haríamos distinto**:
+   - quórum también en el mesh de coordinadores (hoy una partición puede tener dos líderes de mesh);
+   - compactación del log del auth;
+   - persistencia con *write-ahead* en vez de cada 2 s;
+   - medir latencias con un dashboard (track 2.2).
+
+---
+
+# Apéndice: detalle de cada parte
+
+Lo de abajo es la documentación incremental de cada taller (Parte I a IV), con más detalle de cada pieza.
+
+## Resumen de las partes anteriores
+
+Videojuego web multijugador **Uber vs Taxi** del curso de Sistemas Distribuidos. La Parte I (Taller 4) dejó registro, login con JWT y lobby en tiempo real. La **Parte IV (Taller 7)** replica el **auth-service en tres nodos con un líder elegido** (sección Parte IV, justo abajo). La **Parte III (Taller 6)** reparte el juego entre **varios coordinadores en mesh** (sección 0). La Parte II agregó:
 
 - **El juego en vivo**: los jugadores se mueven en una ciudad en 3D (`<canvas>` WebGL con Three.js) y todos ven a todos en tiempo real. **El servidor es la autoridad**: el cliente solo manda intenciones de movimiento y dibuja lo que el coordinador le dice.
 - **Login con Google** (Google Identity Services): convive con usuario/contraseña en **una sola tabla `users`** y ambos métodos producen **el mismo JWT**.
@@ -10,9 +312,206 @@ El sistema son tres procesos independientes que corren en **tres equipos distint
 
 | Componente | Carpeta | Equipo | Puerto | Tecnología | Responsabilidad |
 |---|---|---|---|---|---|
-| Servicio de Autenticación | `auth-service/` | **A** | 4000 | Express + `node:sqlite` + bcrypt + JWT + `google-auth-library` | Registro, login local, login con Google, emitir JWT y **directorio de coordinadores** |
+| Servicio de Autenticación (**tres réplicas**, un líder) | `auth-service/` | **A** | 4000 (o 4000-4002 + cluster 4100-4102) | Express + `node:sqlite` + bcrypt + JWT + `google-auth-library` + `ws` | Registro, login local, login con Google, emitir JWT, **directorio de coordinadores** y **replicación líder/réplica** |
 | Coordinador (uno o **varios en mesh**) | `coordinator/` | **B** | 5000 (o 5001-5003 + mesh 5101-5103) | Express + `ws` + JWT | Validar el JWT, estado autoritativo del juego, game loop a 20 Hz, replicación entre coordinadores |
 | Cliente Web | `client/` | **C** | 3000 | HTML + JS plano (servido con Express) | Login/registro/Google, vista 3D del juego (Three.js), input |
+
+
+
+## Parte IV (Taller 7): auth-service replicado (un líder, dos réplicas)
+
+Hasta el Taller 6 el auth era **un solo proceso**: si se caía, nadie podía registrarse ni entrar, y los coordinadores perdían el directorio. Ahora corren **tres auth** (`auth-a`, `auth-b`, `auth-c`), cada uno con **su propia copia** de la base de datos, y el sistema sigue funcionando con uno caído.
+
+**Modelo: single-writer replication** (`auth-service/replication.js`):
+
+- Hay **un líder** a la vez. **Solo el líder escribe** (registro local y primer ingreso con Google). Aplica la escritura a su BD, la anota en un **log de replicación** numerado (`seq`) y la manda a las réplicas (`write_propagate`).
+- Las **réplicas** aplican las escrituras **en el mismo orden y con los mismos datos**, incluido el `userId`, que lo asigna el líder. Así alice tiene el mismo id en los tres, y un JWT emitido por cualquiera sirve igual.
+- Si el líder se cae, las réplicas **eligen uno nuevo** (algoritmo estilo **Raft**, simplificado). Cuando el caído vuelve, **se sincroniza y queda como réplica**: no le quita el puesto a nadie.
+
+Sin `AUTH_PEERS` el auth funciona **solo** y es siempre líder, como en los talleres anteriores. Así corren los tests de siempre.
+
+### IV.1 Qué responde cada uno
+
+| Petición | Líder | Réplica |
+|---|---|---|
+| `POST /register`, `POST /auth/google` (alta nueva) | La hace y responde **cuando una réplica la confirmó** (ver IV.3) | `503 {"error":"not_leader","leaderUrl":"http://…"}`. El cliente reintenta en `leaderUrl` |
+| `POST /login`, `POST /auth/google` (usuario existente) | Responde | **Responde** si está a menos de `READ_LAG_TOLERANCE` (10) entradas del líder; si no, `503 not_leader` |
+| Usuario que no existe, en una réplica con algo pendiente | — | `503 not_leader`: podría ser un usuario recién creado que todavía no llegó. Decide el líder |
+| Cualquier cosa **durante una elección** | — | `503 {"error":"no_leader"}` |
+| `GET /coordinator`, `GET /token-policy`, `GET /health` | Responde | Responde (el directorio se copia a las réplicas, ver IV.6) |
+
+Endpoints nuevos:
+
+- `GET /status`: `{ authId, role, publicUrl, peerUrl, leaderUrl, knownPeers, lastAppliedSeq, users, term, leaderId, clusterSize }`. Es lo que se mira en la sustentación.
+- `GET /peers`: los **otros auth**, `[{ authId, publicUrl, peerUrl, role, connected }]`. Los coordinadores siguen pidiendo aquí a sus pares del mesh: con su token de coordinador (o `?type=coordinators`) reciben la lista de coordinadores, como en el Taller 6.
+- Todas las respuestas traen los headers `X-Auth-Id` y `X-Auth-Role`. La página los usa para mostrar qué auth la atiende.
+
+Errores de una escritura en el líder:
+- `503 no_quorum`: el líder está solo y no hay a quién replicar.
+- `503 replication_timeout`: ninguna réplica confirmó en 3 s.
+
+### IV.2 Mensajes entre auth (WS, puerto `PEER_PORT` o `/mesh`)
+
+Cada auth escucha a los otros en un **puerto propio** (`--peer-port`, p. ej. 4100) y también en `/mesh` de su puerto HTTP (para ngrok). Para que cada par tenga **una sola conexión**, la inicia el de `authId` **menor**.
+
+| Mensaje | Quién → quién | Para qué |
+|---|---|---|
+| `hello {authId, role, term, lastSeq, lastTerm, auth}` | ambos, al conectar | Presentarse. `auth` es un **JWT firmado con la JWT_SECRET** (`role: 'auth'`): un proceso cualquiera no puede entrar al cluster a inyectar usuarios. Solo se acepta a los `authId` de `AUTH_PEERS` |
+| `heartbeat {authId, term, lastSeq, lastHash, directory}` | líder → réplicas, cada 2 s | "Sigo vivo". Trae el último seq y su hash (la réplica detecta si está atrasada o tiene otra historia) y una copia del directorio de coordinadores |
+| `write_propagate {term, seq, op, data, hash}` | líder → réplicas | Una escritura. `op`: `register`, `register_google` o `import`. `data`: `{userId, username, provider, password_hash, google_sub, email, created_at, vehicle}` |
+| `ack {seq, hash}` | réplica → líder | "Ya tengo hasta este seq" (opción B) |
+| `request_sync {fromSeq, lastSeq, lastHash}` | réplica → líder | "Me falta desde aquí" (al volver o si se saltó algo) |
+| `sync_response {entries, reset}` | líder → réplica | Las entradas que faltan (o el log completo con `reset: true`, ver IV.5) |
+| `election {candidate, term, lastSeq, lastTerm}` | candidato → todos | "Vótenme para el term N" |
+| `vote {voter, term, voteGranted}` | votante → candidato | Sí o no |
+| `new_leader {leader, term}` | líder nuevo → todos | "Gané el term N" |
+| `state {lastSeq, lastTerm}` | réplicas → todos, cada 2 s | Cuán al día está cada una (decide quién puede postularse, ver IV.4) |
+
+### IV.3 Consistencia: elegimos la **opción B** (propagar y después responder)
+
+Con la **opción A**, el líder responde 201 apenas escribe en su BD y replica después. Si se cae en ese instante, alice recibió "cuenta creada" pero **su cuenta no existe en ninguna réplica**. El líder nuevo no la tiene, y cuando el viejo vuelve, su copia se descarta (ver IV.5). Se pierde una cuenta que al usuario se le confirmó.
+
+Con la **opción B** (`commit()` en `replication.js`):
+1. El líder escribe en su BD y en el log.
+2. Manda `write_propagate`.
+3. **Responde 201 recién cuando al menos una réplica mandó `ack`**. Es la mayoría: 2 de 3, contando al líder.
+
+Por qué es suficiente:
+- Si el líder muere justo después del 201, la cuenta ya está en otra máquina.
+- La elección **solo vota a candidatos con el log al menos tan al día** como el del votante (IV.4). La réplica que no tiene a alice no puede ganarle a la que sí la tiene, porque la única otra votante es esa misma. Ninguna escritura confirmada se pierde.
+
+El costo es **algo más de latencia** en el registro (un viaje de ida y vuelta a una réplica, unos ms en LAN). El registro es raro; el login, que es lo frecuente, no paga nada: lo contesta cualquier nodo. Además, con un solo auth vivo **no se puede registrar** (`no_quorum`), mientras que el login sigue andando. Preferimos eso a confirmar cuentas que se pueden perder.
+
+Si ninguna réplica confirma en `AUTH_ACK_TIMEOUT_MS` (3 s), el líder responde `503 replication_timeout`: no le dice "creado" a nadie sin la mayoría.
+
+### IV.4 Elección de líder
+
+- **Term**: número de "mandato" que solo sube y se guarda en disco (`auth_meta`). Todo mensaje lleva su term; el de term viejo se ignora. Un líder que ve un term mayor **deja de ser líder**.
+- **Cuándo**: una réplica que no recibe heartbeat en `AUTH_ELECTION_TIMEOUT_MS` (**6 s**, más un azar de hasta 1,5 s para que dos réplicas no se postulen a la vez) sube el term, se vota a sí misma y manda `election`.
+- **Votar**: cada nodo vota **una sola vez por term**, y solo a un candidato cuyo log sea **al menos tan nuevo** como el suyo (compara `lastTerm` y, en empate, `lastSeq`).
+- **Ganar**: con **mayoría** (2 de 3) es líder, lo anuncia con `new_leader` y empieza a mandar heartbeats. Si hay empate, nadie gana; al vencer su tiempo (distinto por el azar), alguno se postula de nuevo con term + 1.
+- Dos agregados para que la demo sea predecible:
+  - Un nodo **solo se postula si ve a una mayoría**. Uno aislado no infla su term (si no, al volver obligaría a una elección innecesaria).
+  - **No se postula si un par conectado tiene un log más nuevo** (lo sabe por `hello`/`state`). Ese par ganaría igual. Al arrancar, gana el auth que trae los usuarios existentes.
+- **Por qué mayoría**: dos líderes a la vez necesitarían dos mayorías en el mismo term, y en 3 nodos dos mayorías siempre comparten un nodo, que vota una sola vez. Nunca hay dos líderes en el mismo term (sin *split brain*).
+- **Tiempo total**: 6 a 7,5 s sin heartbeat, más un viaje de mensajes. En la prueba con un Edge real, bob se registró **6,4 s después** de apagar al líder.
+
+### IV.5 Sincronización (réplica atrasada o que vuelve)
+
+- El log está **encadenado**: el hash de cada entrada incluye el de la anterior (`sha256(hashAnterior|op|data)`). Comparar el último hash es comparar **toda la historia**.
+- Al conectarse al líder (o si un heartbeat trae otro `lastSeq`/`lastHash`), la réplica manda `request_sync` con su último seq y hash:
+  - **Mismo hash en ese seq**: el líder le manda **solo lo que le falta**. Es el caso normal: un auth que estuvo caído y vuelve.
+  - **Hash distinto**: su historia **divergió**. Pasa con un líder que se cayó con una escritura que nadie confirmó. El líder le manda el log completo y la réplica **rehace su copia** (`reset`). Antes de borrar, guarda un **respaldo** `users.db.bak-<fecha>`: nada se pierde del todo.
+- Cada entrada se verifica con su hash al aplicarla. Un log corrupto o mal ordenado se rechaza y se pide de nuevo.
+- **Arranque desde talleres anteriores**: si la BD ya tenía usuarios y no hay log, entran al log como `op: 'import'`. Así el auth con la BD existente es el más "nuevo", gana la primera elección y los otros dos copian sus usuarios.
+
+### IV.6 Coordinadores y cliente
+
+- **Coordinadores** (`coordinator/auth-pool.js`):
+  - `AUTH_URLS=http://a:4000,http://b:4001,http://c:4002`, o `--auth-urls`; `AUTH_URL` sigue sirviendo.
+  - Mandan el heartbeat al **líder**. Si un auth no responde, prueban el siguiente.
+  - Si contesta una réplica, la respuesta trae `leaderUrl` y el próximo heartbeat va al líder.
+- **El directorio sobrevive a la caída del líder**:
+  - Es estado blando (en memoria), no datos de usuarios.
+  - El líder lo copia a las réplicas en cada heartbeat del cluster, y una réplica también acepta el heartbeat de un coordinador durante la elección.
+  - Comprobado en `coordinator/test/auth-failover.test.js`: con el líder apagado, `GET /coordinator` **nunca** devolvió error.
+- **Cliente** (`client/public/auth-client.js`):
+  - `config.js` trae `AUTH_URLS`, desde `AUTH_URLS` o `PUBLIC_AUTH_URLS` en `client/.env`.
+  - Cada petición va al auth preferido. Si no responde, pasa al siguiente.
+  - Si contesta `not_leader`, reintenta en `leaderUrl`.
+  - Si contesta `no_leader`, espera y reintenta hasta 15 s: el usuario que se registra justo durante la elección no ve un error, solo tarda unos segundos más.
+  - La página muestra **a qué auth le está hablando**: `🔐 Auth: auth-b (líder)`, `🔐 Auth: auth-c (réplica)` o `🔐 Auth: eligiendo líder…`.
+- **Los jugadores no se enteran**:
+  - El coordinador ya validó su JWT al conectarse y el juego no vuelve a llamar al auth.
+  - La caída de un auth **no corta ninguna partida**. Comprobado en el Edge: los ticks siguieron avanzando y no hubo recargas.
+
+### IV.7 Levantar los tres auth
+
+**En un solo equipo** (desarrollo o demo). Cada script pasa id, puertos, BD propia y la lista de pares:
+
+```bash
+cd auth-service
+npm run start:a   # auth-a: HTTP 4000, cluster 4100, users.db   (la BD que ya existía)
+npm run start:b   # auth-b: HTTP 4001, cluster 4101, users-b.db
+npm run start:c   # auth-c: HTTP 4002, cluster 4102, users-c.db
+
+cd coordinator
+npm run cluster:a  # coord-a con --auth-urls http://localhost:4000,http://localhost:4001,http://localhost:4002
+npm run cluster:b
+npm run cluster:c
+
+# client/.env:  AUTH_URLS=http://localhost:4000,http://localhost:4001,http://localhost:4002
+cd client && npm start
+```
+
+> La `JWT_SECRET` tiene que ser **la misma** en los tres `auth-service/.env` y en `coordinator/.env`. Los auth la usan para firmar el `hello` del cluster y los coordinadores para validar los JWT de los jugadores.
+
+**En tres equipos**: en el `.env` de cada auth va la **misma** `AUTH_PEERS` con las IP LAN, y en cada uno su `AUTH_ID`, `PEER_PORT` y `PUBLIC_URL`:
+
+```env
+AUTH_PEERS=auth-a=ws://192.168.1.10:4100,auth-b=ws://192.168.1.11:4100,auth-c=ws://192.168.1.12:4100
+AUTH_ID=auth-b
+PEER_PORT=4100
+PUBLIC_URL=http://192.168.1.11:4000
+```
+
+Hay que abrir los puertos 4000 y 4100 en el firewall de Windows. Los coordinadores y el cliente usan `AUTH_URLS` con las tres URL.
+
+**Con ngrok**: basta **un túnel por auth**, porque el cluster también entra por `/mesh` del puerto HTTP. Se deja `PEER_PORT` vacío y se pone:
+
+```env
+PUBLIC_URL=https://xxx.ngrok-free.dev
+AUTH_PEERS=auth-a=wss://xxx.ngrok-free.dev/mesh,auth-b=wss://yyy.ngrok-free.dev/mesh,auth-c=wss://zzz.ngrok-free.dev/mesh
+```
+
+| Variable (auth) | Ejemplo | Para qué |
+|---|---|---|
+| `AUTH_PEERS` / `--peers` | `auth-a=ws://…:4100,…` | Los tres auth (la misma lista en todos). **Vacío = solo** |
+| `AUTH_ID` / `--id` | `auth-b` | Identidad en el cluster |
+| `PEER_PORT` / `--peer-port` | `4100` | Puerto WS del cluster (vacío = solo `/mesh`) |
+| `PUBLIC_URL` | `http://192.168.1.11:4000` | URL HTTP de este auth para navegadores y coordinadores (va en `leaderUrl`) |
+| `PEER_URL` | `ws://192.168.1.11:4100` | Cómo lo alcanzan los otros auth (informativa, va en `/status` y `/peers`) |
+| `AUTH_HEARTBEAT_MS` / `AUTH_ELECTION_TIMEOUT_MS` | `2000` / `6000` | Heartbeat del líder / sin heartbeat → elección |
+| `AUTH_ACK_TIMEOUT_MS` | `3000` | Opción B: cuánto espera el líder la confirmación de una réplica |
+| `READ_LAG_TOLERANCE` | `10` | Atraso máximo (en entradas) para que una réplica atienda lecturas |
+
+### IV.8 Guion de la sustentación (Taller 7)
+
+Ver el estado de los tres en cualquier momento:
+
+```bash
+curl http://localhost:4000/status; curl http://localhost:4001/status; curl http://localhost:4002/status
+```
+
+1. **Arranque**: 3 auth, 3 coordinadores y los clientes jugando.
+   - En los logs: `auth-a ... es el nuevo LÍDER (term 1 ...)` y en los otros `sigue al líder auth-a`.
+   - `/status`: un `leader` y dos `replica`, con el mismo `users` y `lastAppliedSeq`.
+2. **Registro de alice** desde la página.
+   - El chip dice `🔐 Auth: auth-a (líder)`.
+   - En las réplicas: `replicado seq N (register alice), N+1 usuarios`.
+   - Los tres `/status` muestran **N+1**.
+   - Un `POST /register` directo a una réplica da `503 not_leader` con el `leaderUrl` (`curl -X POST http://localhost:4001/register ...`).
+3. **Ctrl+C al líder** (auth-a).
+   - Los jugadores **siguen jugando**.
+   - A los ~6-8 s: `auth-b ... no hay líder: se postula (term 2)`, `auth-c ... vota por auth-b`, `auth-b ... es el nuevo LÍDER (term 2)`.
+   - Los coordinadores: `[auth] líder de los auth: http://localhost:4001`.
+4. **Registro de bob**.
+   - Si se hace en plena elección, la página espera sola y lo crea apenas hay líder.
+   - El chip pasa a `auth-b (líder)`.
+   - Los dos auth vivos muestran el mismo `users`.
+5. **Vuelve auth-a** (`npm run start:a`).
+   - Log: `sync con auth-b: seq N -> N+1`.
+   - `/status` de auth-a: `role: "replica"`, `leaderUrl` de auth-b y el mismo `users`. **No** recupera el liderazgo.
+
+Todo esto está automatizado:
+- `auth-service/test/cluster.test.js` (3 auth reales con tiempos cortos): los 5 pasos, más `no_quorum` y `no_leader`.
+- `coordinator/test/auth-failover.test.js`: coordinadores y jugador durante la caída del líder.
+
+### IV.9 Límites (dicho claro)
+
+- Para **escribir** hacen falta **2 de 3** auth vivos. Con uno solo se puede entrar pero no registrarse (`no_quorum` / `no_leader`).
+- El directorio de coordinadores es estado blando: no va en el log. Si se caen los tres auth, los coordinadores se vuelven a anunciar en 2 s cuando alguno vuelve.
+- Es un Raft **simplificado** para 3 nodos fijos. No hay cambio de miembros en caliente, ni compactación del log (con usuarios, el log crece unas decenas de bytes por registro), ni pre-vote completo.
 
 ---
 
@@ -215,12 +714,17 @@ y en ese equipo `ngrok http 5002`.
 ```
 SSD_TALLER_4/
 ├── auth-service/
-│   ├── index.js            # /register, /login, /auth/google, /health
+│   ├── index.js            # /register, /login, /auth/google, /health, /status, directorio
+│   ├── replication.js      # Taller 7: líder/réplicas, elección, log replicado, sync
 │   ├── test/               # npm test: endpoints, Google (stub + verificación real), migración
 │   ├── package.json
 │   └── .env.example
 ├── coordinator/
 │   ├── index.js            # WS /connect, game loop, intent/extras_update, /health
+│   ├── mesh.js             # Taller 6: mesh entre coordinadores
+│   ├── auth-pool.js        # Taller 7: AUTH_URLS con failover y seguimiento del líder
+│   ├── persistence.js      # Examen final 2.1: SQLite de estado por coordinador
+│   ├── chat.js             # Examen final 2.6: chat con orden total (secuenciador), rate limit
 │   ├── test/               # npm test: levanta el coordinador real y juega por WS
 │   ├── package.json
 │   └── .env.example
@@ -231,7 +735,10 @@ SSD_TALLER_4/
 │   └── public/
 │       ├── login.html      # login, registro y "Entrar con Google" (+ elegir username)
 │       ├── lobby.html      # vista 3D del juego, controles del feature extra, jugadores en línea
+│       ├── auth-client.js  # Taller 7: AUTH_URLS con failover, not_leader -> líder, indicador
 │       └── style.css
+├── scripts/local-cluster.js # npm run local: levanta 3 auth + 3 coordinadores + cliente en un equipo
+├── package.json            # scripts de la raíz (install:all, local, test)
 ├── .gitignore              # node_modules/, *.db, .env
 └── README.md
 ```
@@ -520,6 +1027,10 @@ Conexión: `ws(s)://<coordinador>/connect?token=<JWT>`. El JWT se valida en el `
 | `pickup` | Un auto recoge al pasajero | `{ type, userId, username, vehicle, score }` (para el aviso en pantalla) |
 | `match_start` | Empieza una ronda | `{ type, round, durationMs }` |
 | `match_end` | Termina una ronda | `{ type, round, winner: "uber"\|"taxi"\|"empate", teams, top: [{ username, vehicle, score }] }` (podio de hasta 3) |
+| `chat_history` / `chat` | Al conectar / cada mensaje (track 2.6) | `{ type: "chat", message: { id, seq, userId, username, vehicle, text, origin, orderedBy } }` (el historial trae la lista) |
+| `chat_error` | Mensaje rechazado | `{ type, reason: "rate_limited"\|"muted"\|"too_long"\|"empty", retryInMs? }` |
+| `match_resume` | Se reanuda una ronda pausada (track 2.1) | `{ type, round, remainingMs }` |
+| `spectator_ignored` | Un espectador mandó algo (track 2.5) | `{ type, reason: "read_only", ignored }` |
 | `session` | Al conectar y cada vez que cambia la duración (`JWT_EXPIRES_IN` / `SESSION_MAX_AGE` en caliente) | `{ type, expiresInMs, reason }`: milisegundos que le quedan a la sesión antes del cierre `4001` (`null` = sin límite). Va el tiempo **restante**, no la hora, así no depende de que los relojes de los equipos coincidan. El cliente lo muestra como cronómetro ⏱ (amarillo en el último minuto, rojo en los últimos 10 s) |
 
 `obstacles` es la lista de lo que choca: un rectángulo `{ kind: "poly", name, points: [[x, y], …] }` por manzana (la colisión también soporta `{ kind: "circle", x, y, r }` y polígonos cóncavos). `blocks` describe qué hay dentro de cada manzana (`type`: `casas`, `conjunto`, `edificio` o `parque`, con sus `houses`, `building` o `trees`) y es **solo decoración**. Las colisiones las resuelve el coordinador.
@@ -530,8 +1041,11 @@ Conexión: `ws(s)://<coordinador>/connect?token=<JWT>`. El JWT se valida en el `
 |---|---|---|
 | `intent` | `{ type: "intent", intent: { dir: { x: -1\|0\|1, y: -1\|0\|1 }, reverse?: true } }` | Guarda `p.intent = { x: Math.sign(x), y: Math.sign(y), reverse: reverse === true }`. **No mueve ni hace broadcast.** `reverse` solo vale si es exactamente `true`: el auto retrocede sin girar, al 60 % de la velocidad. |
 | `extras_update` | `{ type: "extras_update", extras: { color: "#ff5500", mood: "😎" } }` | Si es un objeto (no array) de ≤ 1024 caracteres serializado, lo guarda en `p.extras`. Se replica en el próximo `state`. |
+| `chat` | `{ type: "chat", text }` | Valida (1-200 caracteres, sin caracteres de control), rate limit por usuario y lo manda a numerar al líder del mesh (track 2.6) |
 
-**Códigos de cierre**: `4001 "invalid token"` / `4001 "token expired"` / `4001 "session expired"`, `4002 "session replaced"`, `1009` (mensaje > 4 KB).
+**Espectadores**: `ws(s)://<coordinador>/spectate` sin token; reciben `welcome` (con `spectator: true`, `you: null`), `state` a 10 Hz, eventos y chat; lo que manden se ignora.
+
+**Códigos de cierre**: `4001 "invalid token"` / `4001 "token expired"` / `4001 "session expired"`, `4002 "session replaced"`, `4013 "spectators full"` (espectador en un coordinador lleno), `4008 "flood"` (espectador que inunda), `1009` (mensaje > 4 KB). El cliente cierra con `1000 "logout"` al cerrar sesión: eso borra su estado guardado.
 
 ---
 
@@ -741,8 +1255,8 @@ Igual que en la Parte I: gana la conexión nueva y la anterior se cierra con `40
 ## 12. Tests automáticos
 
 ```bash
-cd auth-service && npm test     # 37 tests (28 + 9 del directorio, con URLs mal configuradas): esquema, /register, /login, /auth/google, migración
-cd coordinator  && npm test     # 39 tests (30 + 9 del mesh con procesos reales): geometría del mapa + coordinador real jugando por WebSocket
+cd auth-service && npm test     # 43 tests (28 + 9 del directorio + 6 del cluster de 3 auth reales): esquema, /register, /login, /auth/google, migración, replicación y elección
+cd coordinator  && npm test     # 49 tests (31 + 9 del mesh + 2 con 3 auth replicados + 7 de los tracks del examen final, procesos reales)
 ```
 
 - **Auth**: los ID tokens de prueba (`fake:<json>`) se resuelven con un stub de `verifyIdToken` (no hace falta una cuenta de Google); cualquier otro token pasa por la verificación **real** de `google-auth-library` y debe ser rechazado (token falsificado con firma propia → `401`).
