@@ -11,6 +11,9 @@ const os = require('node:os');
 const crypto = require('node:crypto');
 const jwt = require('jsonwebtoken');
 const WebSocket = require('ws');
+// Persistencia del examen final: en memoria, así un test no hereda el estado
+// guardado por otro (ni por el coordinador de desarrollo)
+process.env.STATE_DB = ':memory:';
 
 // Los coordinadores de prueba no deben heredar la configuración de despliegue
 // del .env de desarrollo (URLs de ngrok, id, puertos del mesh): vacías = valores
@@ -85,7 +88,7 @@ const find = (state, userId) => state && state.players.find((p) => p.userId === 
 before(async () => {
   procs.auth = await startProc([path.join(__dirname, '..', '..', 'auth-service', 'index.js')], path.join(__dirname, '..', '..', 'auth-service'), {
     PORT: String(AUTH_PORT), JWT_SECRET, DB_FILE, GOOGLE_CLIENT_ID: 'test.apps.googleusercontent.com',
-    JWT_EXPIRES_IN: '1h', DIRECTORY_TTL_MS: String(TTL),
+    JWT_EXPIRES_IN: '1h', DIRECTORY_TTL_MS: String(TTL), AUTH_PEERS: '', PEER_PORT: '',
   }, /Auth service en puerto/);
   for (const id of Object.keys(COORDS)) procs[id] = await startCoordinator(id);
 });
