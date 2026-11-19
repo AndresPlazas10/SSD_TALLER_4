@@ -20,7 +20,7 @@ Todo con `express`, `ws`, `node:sqlite`, `jsonwebtoken`, `bcryptjs` y `google-au
 - [Track 2.6 Chat](#track-26-chat-distribuido-secundario)
 - [Track 2.5 Espectador](#track-25-modo-espectador-extra)
 - [Modos de falla](#modos-de-falla-conocidos)
-- [Cómo levantarlo](#cómo-levantarlo)
+- [Cómo levantarlo](#cómo-levantarlo) (un equipo o [los 4 equipos con ngrok](#despliegue-real-4-equipos-con-ngrok-así-lo-corremos))
 - [Restricciones del enunciado](#restricciones-del-enunciado)
 - [Tests](#tests)
 - [Apéndice: detalle por taller](#apéndice-detalle-de-cada-parte)
@@ -228,14 +228,151 @@ npm run local:light    # 1 auth + 2 coordinadores, para equipos con poca RAM
 
 Abrir http://localhost:3000 para jugar y http://localhost:3000/lobby.html?spectate para mirar. Ctrl+C detiene todo; los coordinadores guardan su estado al salir.
 
-**Tres equipos y ngrok**:
-- Cada equipo corre su parte con su `.env`; la JWT_SECRET es **la misma** en todos.
-- Auth: `AUTH_PEERS` (la misma lista en los tres), `AUTH_ID` y `PUBLIC_URL` de su túnel.
-- Coordinadores: `AUTH_URLS` (los tres auth) y `PUBLIC_URL`/`PEER_URL` de su túnel.
-- Cliente: `AUTH_URLS` / `PUBLIC_AUTH_URLS`.
-- Con ngrok basta **un túnel por proceso**: el cluster de auth entra por `/mesh` y el mesh de coordinadores por la raíz del mismo puerto.
+### Despliegue real: 4 equipos con ngrok (así lo corremos)
 
-Pasos detallados: [IV.7](#iv7-levantar-los-tres-auth), [0.6 ngrok](#06-despliegue-con-ngrok-un-túnel-por-equipo) y [4. Despliegue en tres equipos](#4-despliegue-en-tres-equipos).
+Cada integrante corre sus procesos en **su propio PC** y los expone con ngrok. Nadie está en la misma red: todo pasa por los túneles (`https://` para HTTP y `wss://` para WebSocket).
+
+| Equipo | Integrante | Procesos | Puerto local | Túnel ngrok |
+|---|---|---|---|---|
+| 1 | **Vivian** | auth-a | 4000 | `https://backside-cufflink-reapprove.ngrok-free.dev` |
+| 2 | **Yeimy** | coord-a | 5001 | `https://prorate-linseed-glowing.ngrok-free.dev` |
+| 2 | **Yeimy** | auth-b | 4000 | `https://finlike-stream-rebuild.ngrok-free.dev` |
+| 3 | **Andrés** | coord-c | 5003 | `https://satchel-bankable-pretext.ngrok-free.dev` |
+| 3 | **Andrés** | cliente web | 3000 | `https://basics-ignore-cache.ngrok-free.dev` |
+| 4 | **Omar** | coord-b | 5002 | `https://spindle-overstep-pelt.ngrok-free.dev` |
+| 4 | **Omar** | auth-c | 4000 | `https://whinny-frugally-washhouse.ngrok-free.dev` |
+
+```
+   Equipo 1 (Vivian)        Equipo 2 (Yeimy)            Equipo 4 (Omar)
+   ┌──────────┐             ┌──────────┐ ┌─────────┐    ┌──────────┐ ┌─────────┐
+   │ auth-a   │◀── /mesh ──▶│ auth-b   │ │ coord-a │    │ auth-c   │ │ coord-b │
+   └────▲─────┘             └────▲─────┘ └────▲────┘    └────▲─────┘ └────▲────┘
+        └──────────────── /mesh ─┼────────────┼──────────────┘            │
+                                 │            └──── mesh de coordinadores ┤
+   Equipo 3 (Andrés)             │                                        │
+   ┌───────────┐ ┌─────────┐     │  heartbeats al auth líder (AUTH_URLS)  │
+   │ cliente   │ │ coord-c │◀────┴────────────────────────────────────────┘
+   └───────────┘ └─────────┘
+```
+
+**Reglas que deben cumplir los cuatro equipos:**
+- **El mismo código**: todos con la última versión de `dev` (`git pull`) y `npm install` en `auth-service`, `coordinator` y `client`.
+- **La misma `JWT_SECRET`** en los 3 auth y los 3 coordinadores. Si una difiere, ese proceso rechaza los tokens de los demás: el `hello` del cluster falla, los heartbeats dan `401` y los jugadores reciben `4001`.
+- **La misma `AUTH_PEERS`** en los 3 auth, letra por letra.
+- **Un túnel por proceso**. El cluster de auth entra por `/mesh` del puerto HTTP y el mesh de coordinadores por la raíz del puerto de jugadores: no hace falta abrir puertos extra.
+
+#### Dos túneles en un mismo PC (Yeimy y Omar)
+
+Una cuenta gratis de ngrok da **un solo dominio fijo**, así que quien corre dos procesos usa **dos cuentas**:
+
+```bash
+# Túnel 1, con la cuenta guardada en la configuración de ngrok (ngrok config add-authtoken ...)
+ngrok http 5002                                  # coordinador
+
+# Túnel 2, con el token de la segunda cuenta, sin guardarlo en la configuración
+ngrok http 4000 --authtoken <TOKEN_SEGUNDA_CUENTA>   # auth
+```
+
+No uses `ngrok config add-authtoken` para la segunda cuenta: reemplaza el token de la primera y el próximo `ngrok http` del coordinador saldría con el dominio equivocado. El panel de inspección del segundo túnel queda en http://127.0.0.1:4041, porque el 4040 ya lo ocupa el primero.
+
+#### `auth-service/.env` (Vivian, Yeimy y Omar)
+
+```env
+PORT=4000
+JWT_SECRET=<la del equipo, igual en todos>
+GOOGLE_CLIENT_ID=<el del equipo>
+DB_FILE=users.db
+# IGUAL en los tres
+AUTH_PEERS=auth-a=wss://backside-cufflink-reapprove.ngrok-free.dev/mesh,auth-b=wss://finlike-stream-rebuild.ngrok-free.dev/mesh,auth-c=wss://whinny-frugally-washhouse.ngrok-free.dev/mesh
+PEER_PORT=
+# DISTINTO en cada uno
+AUTH_ID=auth-a                                               # auth-b (Yeimy) · auth-c (Omar)
+PUBLIC_URL=https://backside-cufflink-reapprove.ngrok-free.dev # la https de SU túnel
+PEER_URL=wss://backside-cufflink-reapprove.ngrok-free.dev/mesh
+#   auth-b (Yeimy): https://finlike-stream-rebuild.ngrok-free.dev     · wss://finlike-stream-rebuild.ngrok-free.dev/mesh
+#   auth-c (Omar):  https://whinny-frugally-washhouse.ngrok-free.dev  · wss://whinny-frugally-washhouse.ngrok-free.dev/mesh
+```
+
+```bash
+cd auth-service && npm start        # y en otra terminal: ngrok http 4000 (o con --authtoken)
+```
+
+#### `coordinator/.env` (Yeimy coord-a, Omar coord-b, Andrés coord-c)
+
+```env
+JWT_SECRET=<la del equipo, igual en todos>
+AUTH_URLS=https://backside-cufflink-reapprove.ngrok-free.dev,https://finlike-stream-rebuild.ngrok-free.dev,https://whinny-frugally-washhouse.ngrok-free.dev
+# DISTINTO en cada uno
+COORDINATOR_ID=coord-a                                       # coord-b (Omar) · coord-c (Andrés)
+PORT=5001                                                    # 5002 (Omar) · 5003 (Andrés)
+PEER_PORT=5001                                               # = PORT: el mesh entra por el mismo túnel
+PUBLIC_URL=wss://prorate-linseed-glowing.ngrok-free.dev       # la wss de SU túnel (sin ruta):
+#   coord-b (Omar):   wss://spindle-overstep-pelt.ngrok-free.dev
+#   coord-c (Andrés): wss://satchel-bankable-pretext.ngrok-free.dev
+```
+
+```bash
+cd coordinator && npm start          # y en otra terminal: ngrok http 5001 (5002 / 5003)
+```
+
+#### `client/.env` (Andrés)
+
+```env
+PORT=3000
+GOOGLE_CLIENT_ID=<el del equipo>
+AUTH_URLS=http://localhost:4000
+PUBLIC_AUTH_URLS=https://backside-cufflink-reapprove.ngrok-free.dev,https://finlike-stream-rebuild.ngrok-free.dev,https://whinny-frugally-washhouse.ngrok-free.dev
+```
+
+```bash
+cd client && npm start               # y en otra terminal: ngrok http 3000
+```
+
+Notas sobre el cliente:
+- Los jugadores entran por `https://basics-ignore-cache.ngrok-free.dev`. Por esa URL el cliente entrega `PUBLIC_AUTH_URLS`.
+- Andrés no corre un auth, así que si abre el juego desde su propio PC debe entrar por la URL de ngrok, no por localhost: `AUTH_URLS=http://localhost:4000` no apunta a nada en su equipo.
+- Para que funcione "Acceder con Google", la URL del cliente tiene que estar en **Authorized JavaScript origins** del Client ID en Google Cloud.
+
+#### Orden de arranque
+
+1. **Los tres auth.** Primero el que tiene la base de usuarios buena (el de Vivian), después auth-b y auth-c.
+   - Al verse eligen líder.
+   - Los demás copian los usuarios del que tenga el log más nuevo. Si otro auth tenía usuarios distintos, quedan respaldados en un `users.db.bak-<fecha>`.
+2. **Los tres coordinadores.** Se anuncian al líder del auth y forman el mesh entre ellos.
+3. **El cliente.**
+
+#### Comprobar que todo está bien
+
+```bash
+# Los tres auth: un leader y dos replica, con el mismo lastAppliedSeq y users
+curl https://backside-cufflink-reapprove.ngrok-free.dev/status
+curl https://finlike-stream-rebuild.ngrok-free.dev/status
+curl https://whinny-frugally-washhouse.ngrok-free.dev/status
+
+# Los coordinadores vivos (en cualquier auth) y los pares del cluster
+curl https://whinny-frugally-washhouse.ngrok-free.dev/coordinators
+curl https://whinny-frugally-washhouse.ngrok-free.dev/peers
+
+# Los coordinadores: pares del mesh, líder, jugadores
+curl https://prorate-linseed-glowing.ngrok-free.dev/health
+curl https://spindle-overstep-pelt.ngrok-free.dev/health
+curl https://satchel-bankable-pretext.ngrok-free.dev/health
+
+# El cliente (la página del juego)
+curl -I https://basics-ignore-cache.ngrok-free.dev/login.html
+```
+
+#### Problemas típicos
+
+| Síntoma | Causa | Solución |
+|---|---|---|
+| Un `/status` devuelve una página HTML de ngrok | El túnel está abierto pero el proceso de atrás no corre (502), o el túnel está caído | Levantar el proceso o su `ngrok http` |
+| Los auth quedan en `replica` con `leaderId: null` | No ven a una mayoría: `AUTH_PEERS` distinta, un placeholder (`LINK-DEL-AUTH-…`) o `JWT_SECRET` distinta | Revisar que la lista sea igual en los tres y reiniciar |
+| Un auth no aparece conectado aunque está arriba | El de `authId` **menor** inicia la conexión: si auth-a tiene mal la URL de auth-c, nunca se conectan | Corregir `AUTH_PEERS` en el de id menor |
+| El coordinador repite "directorio no disponible" | Ningún auth de `AUTH_URLS` responde | Levantar al menos un auth y revisar las URLs |
+| El term sube muchas veces | Se cortó un túnel unos segundos (reinicio de ngrok, mala red) y hubo elecciones | Normal: no se pierden datos. Los tres deben terminar con el mismo `seq` |
+
+Más detalle de cada pieza: [IV.7](#iv7-levantar-los-tres-auth), [0.6 ngrok](#06-despliegue-con-ngrok-un-túnel-por-equipo) y [4. Despliegue en tres equipos](#4-despliegue-en-tres-equipos).
 
 | Endpoint útil | Para qué |
 |---|---|
