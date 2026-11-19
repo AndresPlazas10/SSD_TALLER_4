@@ -45,6 +45,8 @@
           <span id="auth-chip" class="stage-chip"></span>
         </div>
         <div id="teams-hud" class="teams-hud" hidden></div>
+        <!-- Los conductores de MI equipo, con sus pasajeros (se ve también en pantalla completa) -->
+        <div id="team-roster" class="team-roster" hidden></div>
         <!-- Examen final (track 2.5): cartel fijo del modo espectador -->
         <div id="spectator-banner" class="spectator-banner" hidden>👀 MODO ESPECTADOR · solo mirar, sin controles · clic en un conductor para seguirlo</div>
         <div id="toast" class="toast-3d" role="status" hidden></div>
@@ -81,15 +83,6 @@
         <div class="moods" id="moods"></div>
       </section>
 
-      <section class="card">
-        <div class="lobby-head">
-          <h2>🚦 En línea</h2>
-          <span class="count-pill"><span id="count">0</span> en la calle</span>
-        </div>
-        <ul id="players"></ul>
-        <p class="empty hidden" id="empty">Esperando conductores…</p>
-      </section>
-
       <!-- Examen final (track 2.6): chat distribuido entre coordinadores -->
       <section class="card chat-card">
         <div class="lobby-head">
@@ -102,6 +95,15 @@
           <button type="submit">Enviar</button>
         </form>
         <p class="hint chat-status" id="chat-status"></p>
+      </section>
+
+      <section class="card">
+        <div class="lobby-head">
+          <h2>🚦 En línea</h2>
+          <span class="count-pill"><span id="count">0</span> en la calle</span>
+        </div>
+        <ul id="players"></ul>
+        <p class="empty hidden" id="empty">Esperando conductores…</p>
       </section>
     </aside>
   </main>
@@ -580,10 +582,14 @@
       const n = 60;
       for (let k = 0; k < n; k++) {
         const a = (k / n) * Math.PI * 2;
-        // Elipse que rodea el mundo con margen
-        const rx = W / 2 + 250 + rand() * 350, rz = H / 2 + 250 + rand() * 350;
+        const dx = Math.cos(a), dz = Math.sin(a);
+        // Distancia del centro al borde del mundo en esa dirección y, desde
+        // ahí, un margen. (Con una elipse, en las diagonales las torres caían
+        // DENTRO del mapa, encima de las manzanas de las esquinas.)
+        const toEdge = Math.min(Math.abs(dx) > 1e-6 ? (W / 2) / Math.abs(dx) : Infinity, Math.abs(dz) > 1e-6 ? (H / 2) / Math.abs(dz) : Infinity);
+        const dist = toEdge + 180 + rand() * 350;
         const w = 50 + rand() * 70, h = 80 + rand() * 220, d = 50 + rand() * 70;
-        put(towers, new THREE.Vector3(Math.cos(a) * rx, 0, Math.sin(a) * rz), [w, h, d], rand() * Math.PI);
+        put(towers, new THREE.Vector3(dx * dist, 0, dz * dist), [w, h, d], rand() * Math.PI);
       }
       flush(towers);
     }
@@ -1074,6 +1080,39 @@
       teamsHud.hidden = false;
     }
 
+    // "Tu equipo": los conductores de mi bando ordenados por pasajeros. Solo se
+    // rehace cuando cambia algo (nombres, puntajes, quién está)
+    const teamRoster = document.getElementById('team-roster');
+    let rosterKey = '';
+    function updateTeamRoster(players) {
+      const me = myUserId && players.find((p) => String(p.userId) === myUserId);
+      if (!me) { teamRoster.hidden = true; rosterKey = ''; return; }
+      const mates = players.filter((p) => p.vehicle === me.vehicle).sort((a, b) => b.score - a.score || a.username.localeCompare(b.username));
+      const key = me.vehicle + '|' + mates.map((p) => `${p.userId}:${p.score}`).join(',');
+      if (key === rosterKey) return;
+      rosterKey = key;
+      teamRoster.textContent = '';
+      teamRoster.classList.toggle('uber', me.vehicle === 'uber');
+      const title = document.createElement('div');
+      title.className = 'roster-title';
+      title.textContent = `${me.vehicle === 'uber' ? '🚘 Tu equipo: UBER' : '🚕 Tu equipo: TAXI'} · ${mates.length}`;
+      const ol = document.createElement('ol');
+      for (const p of mates) {
+        const li = document.createElement('li');
+        if (String(p.userId) === myUserId) li.classList.add('roster-me');
+        const name = document.createElement('span');
+        name.className = 'roster-name';
+        name.textContent = String(p.userId) === myUserId ? `${p.username} (tú)` : p.username; // textContent: sin XSS
+        const score = document.createElement('span');
+        score.className = 'roster-score';
+        score.textContent = `🙋 ${p.score}`;
+        li.append(name, score);
+        ol.append(li);
+      }
+      teamRoster.append(title, ol);
+      teamRoster.hidden = false;
+    }
+
     function updateToast(now) {
       const show = toast && now < toast.until;
       toastEl.hidden = !show;
@@ -1322,6 +1361,7 @@
           else if (guideArrow) guideArrow.visible = false;
         }
         if (lastState.teams) updateTeams(lastState.teams);
+        updateTeamRoster(lastState.players);
         updateRadar(now, lastState.players, lastState.passenger);
       }
       updateToast(now);
@@ -1553,16 +1593,40 @@
       // se vuelve directo al mismo: se pregunta otra vez, excluyendo el caído.
       const coordChip = document.getElementById('coord-chip');
       const authChip = document.getElementById('auth-chip');
-      AuthClient.onChange((i) => {
-        authChip.textContent = AuthClient.label(i);
-        authChip.title = `Auth replicados: ${AuthClient.urls().join(', ')}`;
-      });
       // El juego no necesita al auth (el token ya está validado), pero el
-      // indicador sí: un /health liviano cada 4 s muestra si cayó el auth de
-      // turno y cuál atiende ahora (líder o réplica)
-      setInterval(() => {
-        if (!document.hidden) AuthClient.request('/health', { waitLeaderMs: 0, timeoutMs: 3000 }).catch(() => {});
-      }, 4000);
+      // indicador sí. Cada 2 s se pide /status al auth de turno: dice su rol y
+      // quién es el líder. Si ese auth cae, AuthClient pasa al siguiente de
+      // AUTH_URLS; si el líder cae, /status lo muestra sin líder ("eligiendo")
+      // hasta que gana otro. Nunca queda "cargando": cada consulta tiene límite
+      // de tiempo y no se encima con la anterior.
+      let authStatus = null;
+      let authPolling = false;
+      function renderAuthChip() {
+        const i = AuthClient.current();
+        authChip.title = `Auth replicados: ${AuthClient.urls().join(', ')}`;
+        if (i.state === 'down') { authChip.textContent = '🔐 Auth: sin respuesta, reintentando…'; return; }
+        const s = authStatus;
+        if (!s || !s.authId) { authChip.textContent = AuthClient.label(i); return; }
+        if (s.role === 'leader') authChip.textContent = `🔐 Auth: ${s.authId} (líder)`;
+        else if (!s.leaderId) authChip.textContent = `🔐 Auth: ${s.authId} · sin líder, eligiendo…`;
+        else authChip.textContent = `🔐 Auth: ${s.authId} (réplica) · líder ${s.leaderId}`;
+      }
+      async function pollAuthStatus() {
+        if (authPolling || document.hidden) return;
+        authPolling = true;
+        try {
+          const { status: code, data } = await AuthClient.request('/status', { waitLeaderMs: 0, timeoutMs: 2500 });
+          authStatus = code === 200 && data && data.authId ? data : null;
+        } catch (_) {
+          authStatus = null;
+        } finally {
+          authPolling = false;
+          renderAuthChip();
+        }
+      }
+      AuthClient.onChange(renderAuthChip);
+      pollAuthStatus();
+      setInterval(pollAuthStatus, 2000);
       let reconnectTimer = null;
       let connectAttempt = 0;
       let lastMsgAt = 0;        // último mensaje del coordinador (watchdog)

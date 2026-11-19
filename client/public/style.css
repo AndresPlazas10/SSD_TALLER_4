@@ -810,3 +810,31 @@ li.followable { cursor: pointer; }
 li.is-followed { outline: 1px solid var(--taxi); border-radius: 10px; }
 .spectate-link { text-align: center; margin: 1.1rem 0 0; }
 .spectate-link a { color: var(--taxi); font-weight: 600; }
+
+/* "Tu equipo" dentro del juego: debajo del cronómetro de sesión */
+.team-roster {
+  position: absolute;
+  right: 10px;
+  top: 52px;
+  z-index: 2;
+  min-width: 170px;
+  max-width: 230px;
+  max-height: 45%;
+  overflow-y: auto;
+  padding: .5rem .7rem;
+  border-radius: 12px;
+  background: rgba(8, 9, 12, .78);
+  border: 1px solid rgba(255, 201, 40, .55);
+  color: var(--text);
+  font: 600 .8rem var(--body);
+  pointer-events: none;
+}
+.team-roster.uber { border-color: rgba(46, 230, 166, .55); }
+.team-roster[hidden] { display: none; }
+.roster-title { color: var(--taxi); font-weight: 700; margin-bottom: .3rem; white-space: nowrap; }
+.team-roster.uber .roster-title { color: var(--mint); }
+.team-roster ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .15rem; }
+.team-roster li { display: flex; justify-content: space-between; gap: .6rem; }
+.team-roster li.roster-me { color: #fff; font-weight: 700; }
+.roster-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.roster-score { white-space: nowrap; opacity: .9; }
