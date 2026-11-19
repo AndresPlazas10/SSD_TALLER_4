@@ -1,0 +1,11 @@
+{
+  "name": "uber-vs-taxi",
+  "private": true,
+  "description": "Proyecto final SSD: auth replicado, coordinadores en mesh y cliente web (cada carpeta tiene su propio package.json)",
+  "scripts": {
+    "install:all": "cd auth-service && npm install && cd ../coordinator && npm install && cd ../client && npm install",
+    "local": "node scripts/local-cluster.js",
+    "local:light": "node scripts/local-cluster.js --auths 1 --coords 2",
+    "test": "cd auth-service && npm test && cd ../coordinator && npm test"
+  }
+}
