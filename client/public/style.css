@@ -812,13 +812,21 @@ li.is-followed { outline: 1px solid var(--taxi); border-radius: 10px; }
 .spectate-link a { color: var(--taxi); font-weight: 600; }
 
 /* "Tu equipo" dentro del juego: debajo del cronómetro de sesión */
-.team-roster {
+/* Columna derecha del juego: "Tu equipo" y, en pantalla completa, el chat */
+.stage-right {
   position: absolute;
   right: 10px;
   top: 52px;
-  z-index: 2;
-  min-width: 170px;
-  max-width: 230px;
+  bottom: 56px; /* deja libre el marcador de equipos de abajo */
+  z-index: 3;
+  width: 250px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+.team-roster {
+  flex: 0 1 auto;
   max-height: 45%;
   overflow-y: auto;
   padding: .5rem .7rem;
@@ -838,3 +846,23 @@ li.is-followed { outline: 1px solid var(--taxi); border-radius: 10px; }
 .team-roster li.roster-me { color: #fff; font-weight: 700; }
 .roster-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .roster-score { white-space: nowrap; opacity: .9; }
+
+/* Chat dentro del juego (pantalla completa), debajo de "Tu equipo" */
+.chat-card.in-stage {
+  pointer-events: auto;
+  flex: 0 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: .55rem .7rem;
+  border-radius: 12px;
+  background: rgba(8, 9, 12, .8);
+  border: 1px solid rgba(255, 255, 255, .14);
+  box-shadow: none;
+}
+.chat-card.in-stage .lobby-head { margin-bottom: .2rem; }
+.chat-card.in-stage h2 { font-size: .9rem; margin: 0; }
+.chat-card.in-stage .chat-log { max-height: 190px; min-height: 0; flex: 1 1 auto; font-size: .8rem; margin: .2rem 0 .4rem; }
+.chat-card.in-stage .chat-form input { padding: .35rem .5rem; font-size: .8rem; }
+.chat-card.in-stage .chat-form button { padding: .35rem .7rem; font-size: .8rem; }
+.chat-card.in-stage .chat-status { font-size: .75rem; margin-top: .2rem; }

@@ -46,7 +46,12 @@
         </div>
         <div id="teams-hud" class="teams-hud" hidden></div>
         <!-- Los conductores de MI equipo, con sus pasajeros (se ve también en pantalla completa) -->
-        <div id="team-roster" class="team-roster" hidden></div>
+        <!-- Columna derecha dentro del juego: "Tu equipo" y, en pantalla
+             completa, el chat debajo (se mueve aquí al entrar y vuelve al
+             panel lateral al salir) -->
+        <div id="stage-right" class="stage-right">
+          <div id="team-roster" class="team-roster" hidden></div>
+        </div>
         <!-- Examen final (track 2.5): cartel fijo del modo espectador -->
         <div id="spectator-banner" class="spectator-banner" hidden>👀 MODO ESPECTADOR · solo mirar, sin controles · clic en un conductor para seguirlo</div>
         <div id="toast" class="toast-3d" role="status" hidden></div>
@@ -1941,6 +1946,22 @@
         clearTimeout(chatStatusTimer);
         chatStatusTimer = setTimeout(() => { chatStatus.textContent = ''; chatStatus.classList.remove('error'); }, 4000);
       }
+      // Pantalla completa: solo se ve el juego, así que el chat (la misma
+      // tarjeta, con su historial y su campo) pasa a la columna derecha del
+      // juego, debajo de "Tu equipo". Al salir vuelve a su lugar en el panel.
+      const chatCard = document.querySelector('.chat-card');
+      const chatHome = { parent: chatCard.parentNode, next: chatCard.nextElementSibling };
+      document.addEventListener('fullscreenchange', () => {
+        const full = document.fullscreenElement === stage;
+        if (full && chatCard.parentNode !== document.getElementById('stage-right')) {
+          document.getElementById('stage-right').append(chatCard);
+        } else if (!full && chatCard.parentNode !== chatHome.parent) {
+          chatHome.parent.insertBefore(chatCard, chatHome.next);
+        }
+        chatCard.classList.toggle('in-stage', full);
+        chatLog.scrollTop = chatLog.scrollHeight;
+      });
+
       document.getElementById('chat-form').addEventListener('submit', (e) => {
         e.preventDefault();
         const text = chatInput.value.trim();
