@@ -13,8 +13,23 @@ const CELL = 200;     // tamaño de cada manzana + la mitad de las calles que la
 const SIDEWALK = 8;   // ancho del andén dentro de la manzana
 const GAP = 3;        // separación entre casas vecinas
 
-// Tipos de manzana, recorridos con un salto para que las vecinas no se repitan
-const BLOCK_TYPES = ['casas', 'parque', 'conjunto', 'edificio', 'casas', 'conjunto'];
+// Barrios: qué tan probable es cada tipo de manzana según la distancia al
+// centro de la ciudad (0 = centro, 1 = esquinas). El centro es de edificios
+// altos (skyline) y las afueras, de casas. Los parques aparecen en todos.
+const DISTRICTS = [
+  { upTo: 0.3, weights: { edificio: 0.68, conjunto: 0.17, parque: 0.1, casas: 0.05 }, floors: [8, 14] },
+  { upTo: 0.62, weights: { edificio: 0.25, casas: 0.35, conjunto: 0.25, parque: 0.15 }, floors: [4, 8] },
+  { upTo: Infinity, weights: { casas: 0.5, conjunto: 0.3, parque: 0.15, edificio: 0.05 }, floors: [3, 5] },
+];
+
+function pickWeighted(weights, r) {
+  let acc = 0;
+  for (const [type, w] of Object.entries(weights)) {
+    acc += w;
+    if (r < acc) return type;
+  }
+  return Object.keys(weights)[0];
+}
 
 // Generador pseudoaleatorio con semilla (mulberry32): el mismo mundo da
 // siempre la misma ciudad, en todas las máquinas y tras reiniciar.
@@ -49,7 +64,7 @@ function houseRow(x, y, w, h, count, ridge, rand) {
 }
 
 // Contenido de una manzana. (x, y, s) es el lote dentro del andén.
-function blockContents(type, x, y, s, rand) {
+function blockContents(type, x, y, s, rand, floors) {
   if (type === 'casas') {
     // Dos filas de casas, una mirando a cada calle, con patios en el medio
     const h = Math.round(s * 0.42);
@@ -73,7 +88,10 @@ function blockContents(type, x, y, s, rand) {
     return { houses };
   }
   if (type === 'edificio') {
-    return { building: { x: x + 4, y: y + 4, w: s - 8, h: s - 8, units: 2 + Math.floor(rand() * 3) } };
+    // floors: pisos (el cliente lo usa para la altura); units: equipos en la azotea
+    const [minF, maxF] = floors;
+    return { building: { x: x + 4, y: y + 4, w: s - 8, h: s - 8, units: 2 + Math.floor(rand() * 3),
+      floors: minF + Math.floor(rand() * (maxF - minF + 1)) } };
   }
   // parque: árboles en posiciones con semilla alrededor de una fuente central
   const trees = [];
@@ -96,9 +114,14 @@ function buildCity(width, height, playerRadius) {
 
   const cols = Math.floor(width / CELL);
   const rows = Math.floor(height / CELL);
+  const cx = (cols * CELL) / 2, cy = (rows * CELL) / 2;
+  const maxDist = Math.hypot(cx, cy) || 1;
   for (let j = 0; j < rows; j++) {
     for (let i = 0; i < cols; i++) {
-      const type = BLOCK_TYPES[(i * 2 + j * 3) % BLOCK_TYPES.length];
+      // Tipo según el barrio (distancia al centro) y un sorteo con semilla
+      const d = Math.hypot(i * CELL + CELL / 2 - cx, j * CELL + CELL / 2 - cy) / maxDist;
+      const district = DISTRICTS.find((z) => d <= z.upTo);
+      const type = pickWeighted(district.weights, seeded(5000 + j * 97 + i)());
       const x0 = i * CELL + margin;
       const y0 = j * CELL + margin;
       city.obstacles.push({
@@ -110,7 +133,7 @@ function buildCity(width, height, playerRadius) {
       const lot = size - 2 * SIDEWALK;
       city.blocks.push({
         type, x: x0, y: y0, size,
-        ...blockContents(type, x0 + SIDEWALK, y0 + SIDEWALK, lot, rand),
+        ...blockContents(type, x0 + SIDEWALK, y0 + SIDEWALK, lot, rand, district.floors),
       });
     }
   }
