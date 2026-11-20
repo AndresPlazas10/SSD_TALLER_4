@@ -188,11 +188,13 @@ function isUniqueViolation(err) {
 const DUMMY_HASH = bcrypt.hashSync('dummy-password', BCRYPT_ROUNDS);
 
 const app = express();
-// X-Auth-Id / X-Auth-Role: el navegador muestra qué auth le respondió
-app.use(cors({ exposedHeaders: ['X-Auth-Id', 'X-Auth-Role'] }));
+// X-Auth-Id / X-Auth-Role: qué auth respondió. X-Auth-Leader: quién es el
+// líder del cluster (vacío si no hay); es lo que muestra la página.
+app.use(cors({ exposedHeaders: ['X-Auth-Id', 'X-Auth-Role', 'X-Auth-Leader'] }));
 app.use((req, res, next) => {
   res.set('X-Auth-Id', replication.authId);
   res.set('X-Auth-Role', replication.role());
+  res.set('X-Auth-Leader', replication.leaderId() || '');
   next();
 });
 app.use(express.json({ limit: '4kb' }));

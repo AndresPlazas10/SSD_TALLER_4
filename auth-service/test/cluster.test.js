@@ -207,7 +207,7 @@ test('5. vuelve el auth caído: se sincroniza (tiene a bob) y queda como réplic
   assert.strictEqual(l.data.vehicle, 'uber');
 });
 
-test('6. un líder sin mayoría no confirma escrituras (no_quorum) y una réplica sola no tiene líder (no_leader)', { timeout: 90000 }, async () => {
+test('6. un líder sin mayoría no confirma escrituras (no_quorum); un auth solo no se elige ni registra, pero sí atiende login', { timeout: 90000 }, async () => {
   const replicas = IDS.filter((id) => id !== leader);
   await stop(replicas[0]);
   await stop(replicas[1]);
@@ -224,6 +224,11 @@ test('6. un líder sin mayoría no confirma escrituras (no_quorum) y una réplic
   assert.notStrictEqual(s.role, 'leader');
   const w = await postJson(`${nodes[replicas[0]].url}/register`, { username: 'frank', password: 'secreta1' });
   assert.deepStrictEqual([w.status, w.data.error], [503, 'no_leader']);
+  // Leer sí: el login sigue funcionando en el auth que quedó solo
   const l = await postJson(`${nodes[replicas[0]].url}/login`, { username: 'erin', password: 'secreta1' });
-  assert.deepStrictEqual([l.status, l.data.error], [503, 'no_leader']);
+  assert.strictEqual(l.status, 200);
+  assert.ok(l.data.token);
+  // Un usuario que no existe: 401 normal (sin líder no hay a quién preguntarle)
+  const x = await postJson(`${nodes[replicas[0]].url}/login`, { username: 'nadie_aqui', password: 'secreta1' });
+  assert.strictEqual(x.status, 401);
 });
