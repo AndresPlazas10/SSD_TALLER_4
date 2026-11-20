@@ -474,7 +474,8 @@ Sin `AUTH_PEERS` el auth funciona **solo** y es siempre líder, como en los tall
 | `POST /register`, `POST /auth/google` (alta nueva) | La hace y responde **cuando una réplica la confirmó** (ver IV.3) | `503 {"error":"not_leader","leaderUrl":"http://…"}`. El cliente reintenta en `leaderUrl` |
 | `POST /login`, `POST /auth/google` (usuario existente) | Responde | **Responde** si está a menos de `READ_LAG_TOLERANCE` (10) entradas del líder; si no, `503 not_leader` |
 | Usuario que no existe, en una réplica con algo pendiente | — | `503 not_leader`: podría ser un usuario recién creado que todavía no llegó. Decide el líder |
-| Cualquier cosa **durante una elección** | — | `503 {"error":"no_leader"}` |
+| Escritura **sin líder** (elección en curso, o el auth quedó solo) | — | `503 {"error":"no_leader"}` |
+| Login **sin líder** | — | **Responde** con lo que tiene: todo lo confirmado hasta que perdió al líder. Un auth que queda solo sigue dejando entrar a los usuarios |
 | `GET /coordinator`, `GET /token-policy`, `GET /health` | Responde | Responde (el directorio se copia a las réplicas, ver IV.6) |
 
 Endpoints nuevos:

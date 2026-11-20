@@ -1660,9 +1660,10 @@
         if (i.state === 'down') { authChip.textContent = '🔐 Auth: sin respuesta, reintentando…'; return; }
         const s = authStatus;
         if (!s || !s.authId) { authChip.textContent = AuthClient.label(i); return; }
-        if (s.role === 'leader') authChip.textContent = `🔐 Auth: ${s.authId} (líder)`;
-        else if (!s.leaderId) authChip.textContent = `🔐 Auth: ${s.authId} · sin líder, eligiendo…`;
-        else authChip.textContent = `🔐 Auth: ${s.authId} (réplica) · líder ${s.leaderId}`;
+        // Solo el líder. Sin líder (elección en curso o un solo auth vivo) se
+        // puede seguir entrando, pero no registrarse
+        authChip.textContent = s.leaderId ? `🔐 Auth líder: ${s.leaderId}` : '🔐 Auth: sin líder · login sí, registro en espera';
+        authChip.title = `Auth replicados: ${AuthClient.urls().join(', ')} · respondió ${s.authId} (${s.role === 'leader' ? 'líder' : 'réplica'})`;
       }
       async function pollAuthStatus() {
         if (authPolling || document.hidden) return;
