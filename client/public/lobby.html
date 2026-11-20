@@ -39,6 +39,8 @@
         <div class="stage-tools">
           <button type="button" id="camera-mode" class="stage-btn" title="Cambiar cámara (C)">🎥 Vista de la ciudad</button>
           <button type="button" id="fullscreen" class="stage-btn" title="Pantalla completa (F)">⛶ Pantalla completa</button>
+          <!-- Espectador: pasar al siguiente conductor (también con la tecla N) -->
+          <button type="button" id="follow-next" class="stage-btn" title="Seguir al siguiente conductor (N)" hidden>👁 Seguir conductor (N)</button>
           <!-- A qué coordinador del mesh está conectado este cliente -->
           <span id="coord-chip" class="stage-chip" hidden></span>
           <!-- Y a qué auth replicado (Taller 7) le pidió el coordinador -->
@@ -53,7 +55,7 @@
           <div id="team-roster" class="team-roster" hidden></div>
         </div>
         <!-- Examen final (track 2.5): cartel fijo del modo espectador -->
-        <div id="spectator-banner" class="spectator-banner" hidden>👀 MODO ESPECTADOR · solo mirar, sin controles · clic en un conductor para seguirlo</div>
+        <div id="spectator-banner" class="spectator-banner" hidden>👀 MODO ESPECTADOR · solo mirar · clic en un auto (o N) para seguirlo</div>
         <div id="toast" class="toast-3d" role="status" hidden></div>
         <!-- Partida Uber vs Taxi: ronda y tiempo, y el cartel del ganador -->
         <div id="match-hud" class="match-hud" hidden></div>
@@ -258,11 +260,7 @@
           li.classList.add('followable');
           li.title = 'Seguir a este conductor';
           if (String(p.userId) === followId) li.classList.add('is-followed');
-          li.addEventListener('click', () => {
-            followId = String(p.userId);
-            setCameraMode('seguir');
-            for (const x of ul.querySelectorAll('li')) x.classList.toggle('is-followed', x === li);
-          });
+          li.addEventListener('click', () => followPlayer(String(p.userId)));
         }
         if (String(p.userId) === myUserId) {
           li.classList.add('is-me');
@@ -311,6 +309,44 @@
     // Si Three.js no cargó, THREE no existe: esto evita un error al declarar
     // las variables y la pantalla muestra un aviso (ver init3D).
     function newVector() { return window.THREE ? new THREE.Vector3() : { x: 0, y: 0, z: 0 }; }
+
+    // ----- Espectador: seguir a un conductor -----
+    // Se elige con un clic sobre su auto en el juego, en la lista "En línea" o
+    // con N (el siguiente). La cámara pasa a "seguir" y el cartel dice a quién.
+    // null = vista de la ciudad.
+    function followPlayer(id) {
+      followId = id;
+      const p = id && lastState && lastState.players.find((x) => String(x.userId) === id);
+      const banner = document.getElementById('spectator-banner');
+      banner.textContent = p
+        ? `👀 MODO ESPECTADOR · siguiendo a ${p.username} · N: siguiente · C: vista de la ciudad`
+        : '👀 MODO ESPECTADOR · solo mirar · clic en un auto (o N) para seguirlo';
+      for (const li of document.querySelectorAll('#players li')) li.classList.toggle('is-followed', li.dataset.userId === id);
+      if (p && cameraMode !== 'seguir') setCameraMode('seguir');
+    }
+    function followNext() {
+      const list = lastState ? lastState.players : [];
+      if (!list.length) return followPlayer(null);
+      const i = list.findIndex((x) => String(x.userId) === followId);
+      followPlayer(String(list[(i + 1) % list.length].userId));
+    }
+    // Auto más cercano al punto del clic, en pantalla (tolerancia de 60 px)
+    function carAtScreen(clientX, clientY) {
+      if (!renderer || !camera) return null;
+      const rect = renderer.domElement.getBoundingClientRect();
+      let best = null, bestD = 60;
+      for (const [id, car] of cars) {
+        const v = car.group.position.clone();
+        v.y += 8; // centro del auto, no la base
+        v.project(camera);
+        if (v.z > 1) continue; // detrás de la cámara
+        const x = rect.left + (v.x + 1) / 2 * rect.width;
+        const y = rect.top + (1 - v.y) / 2 * rect.height;
+        const d = Math.hypot(x - clientX, y - clientY);
+        if (d < bestD) { bestD = d; best = id; }
+      }
+      return best;
+    }
 
     const ROOFS = ['#b5523b', '#9c4434', '#7d5e48', '#55657c', '#a36f3f'];
     const WALLS = ['#e9dcc3', '#d9c6a5', '#f1e7d6', '#cfd6dc', '#e4cfc0'];
@@ -1180,6 +1216,8 @@
       // El espectador no maneja: no tiene vista desde la cabina
       const modes = SPECTATOR ? ['ciudad', 'seguir'] : CAMERA_MODES;
       setCameraMode(modes[(modes.indexOf(cameraMode) + 1) % modes.length]);
+      // Espectador: "seguir" sin nadie elegido toma al primero; "ciudad" deja de seguir
+      if (SPECTATOR) { if (cameraMode === 'seguir' && !followId) followNext(); else if (cameraMode === 'ciudad') followPlayer(null); }
       cameraBtn.blur(); // que la barra espaciadora/Enter no vuelvan a cambiar el modo
     });
     setCameraMode(cameraMode);
@@ -1206,6 +1244,7 @@
       if (e.repeat || e.ctrlKey || e.metaKey || e.altKey || e.target.tagName === 'INPUT') return;
       if (e.code === 'KeyF') { e.preventDefault(); toggleFullscreen(); }
       if (e.code === 'KeyC') { e.preventDefault(); cameraBtn.click(); }
+      if (e.code === 'KeyN' && SPECTATOR) { e.preventDefault(); followNext(); }
     });
 
     // Desde el asiento se ve el cielo: fondo y niebla claros, lente más abierta
@@ -1360,6 +1399,7 @@
           else placeLabel(car.label, x, y, 34);
         }
         for (const id of [...cars.keys()]) if (!seen.has(id)) removeCar(id);
+        if (SPECTATOR && followId && !seen.has(followId)) { followPlayer(null); setCameraMode('ciudad'); }
         if (lastState.passenger) {
           updatePassenger(lastState.passenger, now, myPos);
           if (myPos) updateGuide(myPos.x, myPos.y, lastState.passenger);
@@ -1465,6 +1505,14 @@
         document.body.classList.add('spectator');
         document.getElementById('spectator-badge').hidden = false;
         document.getElementById('spectator-banner').hidden = false;
+        const nextBtn = document.getElementById('follow-next');
+        nextBtn.hidden = false;
+        nextBtn.addEventListener('click', () => { followNext(); nextBtn.blur(); });
+        stage.addEventListener('click', (e) => {
+          if (e.target.closest('button, .chat-card')) return;
+          const id = carAtScreen(e.clientX, e.clientY);
+          if (id) followPlayer(id);
+        });
         document.getElementById('extras-card').hidden = true;
         document.getElementById('chat-form').hidden = true;
         document.getElementById('chat-status').textContent = 'Los espectadores leen el chat pero no pueden escribir.';
