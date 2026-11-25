@@ -776,6 +776,8 @@ kbd {
 .chat-who.taxi { color: var(--taxi); }
 .chat-text { color: var(--text, #e8eaf0); }
 .chat-form { display: flex; gap: .4rem; }
+/* display: flex le gana al atributo hidden: sin esto el espectador veía el campo */
+.chat-form[hidden] { display: none; }
 .chat-form input { flex: 1; margin: 0; }
 .chat-form button { padding: .5rem .9rem; margin: 0; width: auto; }
 .chat-status { min-height: 1.1em; margin: .35rem 0 0; }
@@ -866,3 +868,6 @@ li.is-followed { outline: 1px solid var(--taxi); border-radius: 10px; }
 .chat-card.in-stage .chat-form input { padding: .35rem .5rem; font-size: .8rem; }
 .chat-card.in-stage .chat-form button { padding: .35rem .7rem; font-size: .8rem; }
 .chat-card.in-stage .chat-status { font-size: .75rem; margin-top: .2rem; }
+
+/* Espectador: el juego se puede clickear para elegir a quién seguir */
+body.spectator .world-3d canvas { cursor: pointer; }
