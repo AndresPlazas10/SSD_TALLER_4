@@ -513,16 +513,20 @@ function createReplication({
 
   // ¿Puede este nodo responder una LECTURA (login, Google de un usuario existente)?
   // Sí, si es líder o si es una réplica con menos de readLagTolerance entradas de atraso.
+  // Sin líder (elección en curso, o este auth quedó solo) también: tiene todo
+  // lo que se confirmó hasta que perdió al líder, así que el login sigue
+  // funcionando. Lo que NO se puede sin mayoría es escribir (ver writeCheck).
   function readCheck() {
     if (standalone || role === 'leader') return null;
-    if (!leaderAlive()) return { status: 503, body: { error: 'no_leader' } };
+    if (!leaderAlive()) return null;
     if (leaderLastSeq - last.seq >= readLagTolerance) {
       return { status: 503, body: { error: 'not_leader', leaderUrl: leaderPublicUrl(), reason: 'replica_lagging' } };
     }
     return null;
   }
-  // Réplica con alguna entrada pendiente: un "no existe" podría ser atraso
-  const isBehind = () => !standalone && role !== 'leader' && leaderLastSeq > last.seq;
+  // Réplica con alguna entrada pendiente: un "no existe" podría ser atraso.
+  // Sin líder vivo no hay a quién preguntarle: se contesta con lo que hay.
+  const isBehind = () => !standalone && role !== 'leader' && leaderAlive() && leaderLastSeq > last.seq;
 
   function writeCheck() {
     if (standalone || role === 'leader') return null;
@@ -601,6 +605,7 @@ function createReplication({
   return {
     standalone, commit, readCheck, writeCheck, isBehind, status, peerList, handleUpgrade, close,
     role: () => role,
+    leaderId: () => (leaderAlive() ? leaderId : null),
     leaderUrl: () => (leaderAlive() ? leaderPublicUrl() : null),
     authId,
   };
