@@ -157,16 +157,20 @@ function createReplication({
     role = 'leader';
     leaderId = authId;
     for (const l of links.values()) l.matchSeq = 0;
-    log(`es el nuevo LÍDER (term ${currentTerm}, seq ${last.seq}, ${votes.size} de ${clusterSize} votos)`);
+    log(`es el nuevo LÍDER (term ${currentTerm}, seq ${last.seq}, ${votes.size} de ${links.size + 1} vivos / ${clusterSize} nodos)`);
     broadcast({ type: 'new_leader', leader: authId, term: currentTerm, publicUrl });
     sendHeartbeat();
   }
 
-  // Se postula solo si ve a una mayoría (aislado no infla el term) y si ningún
-  // par conectado tiene un log más nuevo (ese par ganaría igual; así, al
-  // arrancar, gana el que trae los usuarios existentes).
+  // Mayoría sobre los nodos vivos conectados: con 2 o 3 vivos exige 2 votos;
+  // si los otros dos cayeron y queda 1 solo vivo (links.size === 0), ese último
+  // sobreviviente puede asumir como líder con su propio voto (1 de 1 vivo).
+  const activeMajority = () => Math.floor((links.size + 1) / 2) + 1;
+
+  // Se postula si ningún par conectado tiene un log más nuevo (ese par ganaría
+  // igual; así, al arrancar, gana el que trae los usuarios existentes).
   function canRunForLeader() {
-    if (links.size + 1 < majority) return false;
+    if (links.size + 1 < activeMajority()) return false;
     for (const id of links.keys()) {
       const p = peerInfo.get(id);
       if (p && !atLeastAsNew(last.term, last.seq, p.lastTerm, p.lastSeq)) return false;
@@ -184,7 +188,7 @@ function createReplication({
     resetElectionTimer();
     log(`no hay líder: se postula (term ${currentTerm}, seq ${last.seq})`);
     broadcast({ type: 'election', candidate: authId, term: currentTerm, lastSeq: last.seq, lastTerm: last.term });
-    if (votes.size >= majority) becomeLeader();
+    if (votes.size >= activeMajority()) becomeLeader();
   }
 
   function sendHeartbeat() {
@@ -258,10 +262,11 @@ function createReplication({
   }
 
   function checkPending() {
+    const need = activeMajority();
     for (let i = pendingAcks.length - 1; i >= 0; i--) {
       const p = pendingAcks[i];
       const acked = [...links.values()].filter((l) => (l.matchSeq || 0) >= p.seq).length;
-      if (acked + 1 >= majority) {
+      if (acked + 1 >= need) {
         clearTimeout(p.timer);
         pendingAcks.splice(i, 1);
         p.resolve();
@@ -374,7 +379,7 @@ function createReplication({
         if (msg.term > currentTerm) { becomeFollower(msg.term, null); return; }
         if (role !== 'candidate' || msg.term !== currentTerm || msg.voter !== peerId || msg.voteGranted !== true) return;
         votes.add(peerId);
-        if (votes.size >= majority) becomeLeader();
+        if (votes.size >= activeMajority()) becomeLeader();
         return;
       }
       default:
@@ -411,9 +416,24 @@ function createReplication({
       if (!links.has(peerId) || links.get(peerId).ws !== ws) return;
       links.delete(peerId);
       log(`se fue ${peerId}${peerId === leaderId ? ' (era el líder)' : ''}`);
-      if (role === 'leader' && links.size + 1 < majority) log('sin mayoría: las escrituras quedan bloqueadas hasta que vuelva un nodo');
+      if (role === 'leader') checkPending();
     });
-    if (h.term > currentTerm) becomeFollower(h.term, h.role === 'leader' ? peerId : null);
+    const peerTerm = Number(h.term) || 0;
+    const peerLastTerm = Number(h.lastTerm) || 0;
+    const peerLastSeq = Number(h.lastSeq) || 0;
+    const peerBetterLeader = h.role === 'leader' && (
+      peerTerm > currentTerm
+      || (peerTerm === currentTerm && (!atLeastAsNew(last.term, last.seq, peerLastTerm, peerLastSeq)
+        || (last.term === peerLastTerm && last.seq === peerLastSeq && peerId < authId)))
+    );
+    if (peerTerm > currentTerm || peerBetterLeader) {
+      becomeFollower(Math.max(currentTerm, peerTerm), h.role === 'leader' ? peerId : null);
+      if (h.role === 'leader') {
+        lastHeartbeatAt = Date.now();
+        resetElectionTimer();
+        requestSync(true);
+      }
+    }
     // Un líder avisa enseguida al que acaba de conectarse
     if (role === 'leader') {
       send(peerId, { type: 'new_leader', leader: authId, term: currentTerm, publicUrl });
@@ -540,7 +560,7 @@ function createReplication({
   async function commit(op, leaderApply) {
     const blocked = writeCheck();
     if (blocked) throw new ReplicationError(blocked.body.error, { leaderUrl: blocked.body.leaderUrl });
-    if (!standalone && links.size + 1 < majority) throw new ReplicationError('no_quorum');
+    if (!standalone && links.size + 1 < activeMajority()) throw new ReplicationError('no_quorum');
     let data;
     let entry;
     db.exec('BEGIN');
