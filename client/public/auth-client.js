@@ -6,8 +6,8 @@
 //   se reintenta en el líder y pasa a ser el preferido.
 // - Si contestan 503 { error: 'no_leader' } (elección en curso, ~6-10 s), se
 //   reintenta solo durante waitLeaderMs antes de rendirse.
-// - Cada respuesta trae X-Auth-Id / X-Auth-Role: la página muestra a qué auth
-//   está hablando (AuthClient.onChange).
+// - Cada respuesta trae X-Auth-Id / X-Auth-Role (quién respondió) y
+//   X-Auth-Leader (quién es el líder): la página muestra el líder (AuthClient.onChange).
 (function () {
   const cfg = window.APP_CONFIG || {};
   const clean = (u) => String(u || '').trim().replace(/\/+$/, '');
@@ -60,6 +60,8 @@
       }
       const authId = res.headers.get('X-Auth-Id');
       const role = res.headers.get('X-Auth-Role');
+      // '' = el cluster no tiene líder ahora; null = auth viejo sin el header
+      const leader = res.headers.get('X-Auth-Leader');
       last = { res, data: data || {}, url, authId, role };
       // Sin JSON: no es el auth (p. ej. la página de "túnel offline" de ngrok)
       if (data === null) continue;
@@ -71,7 +73,7 @@
       if (res.status === 503 && data.error === 'no_leader') { noLeader = true; continue; }
       if (url !== preferred) console.log(`[auth] ahora se usa ${authId || url}`);
       prefer(url);
-      update({ url, authId, role, state: 'ok' });
+      update({ url, authId, role, leader, state: 'ok' });
       return { done: true, res, data: data || {}, url };
     }
     return { done: false, noLeader, last };
@@ -100,11 +102,14 @@
     current: () => info,
     onChange(fn) { listeners.push(fn); fn(info); },
     // Texto corto para el indicador de la página
+    // Se muestra solo el LÍDER del cluster (no la réplica que respondió)
     label(i = info) {
       if (i.state === 'electing') return '🔐 Auth: eligiendo líder…';
       if (i.state === 'down') return '🔐 Auth: sin respuesta, reintentando…';
       if (!i.authId) return `🔐 Auth: ${i.url ? new URL(i.url).host : '—'}`;
-      return `🔐 Auth: ${i.authId} (${i.role === 'leader' ? 'líder' : i.role === 'replica' ? 'réplica' : i.role})`;
+      if (i.leader) return `🔐 Auth líder: ${i.leader}`;
+      if (i.leader === '') return '🔐 Auth: sin líder · login sí, registro en espera';
+      return i.role === 'leader' ? `🔐 Auth líder: ${i.authId}` : `🔐 Auth: ${i.authId}`;
     },
   };
 })();
